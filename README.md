@@ -7,7 +7,8 @@ Drizzle support.
 ## Prerequisites
 
 - Node.js `>=22.13.0`
-- Linux with `flock`, `curl`, and GNU `timeout`
+- Native Windows or Linux for production builds
+- Linux with `flock`, `curl`, GNU `timeout`, and `sha256sum` for `npm run install:ci`
 
 ## Sites Lifecycle
 
@@ -15,7 +16,7 @@ The Sites lifecycle CLI runs the locked dependency install before returning this
 
 This starter does not use `wrangler.jsonc`.
 
-`install:ci` is intentionally a single, non-retrying `npm ci`. It refuses a concurrent install for the same project, consumes a matching image-seeded npm cache with `--prefer-offline` while retaining registry fallback for a missing cache object, otherwise downloads and verifies the complete vinext tarball recorded in `package-lock.json`, limits npm to one socket, and terminates a stalled install. `build` applies a short timeout. These helpers target Linux and use GNU `timeout`; they are not native macOS scripts.
+`install:ci` is intentionally a single, non-retrying `npm ci`. It refuses a concurrent install for the same project, consumes a matching image-seeded npm cache with `--prefer-offline` while retaining registry fallback for a missing cache object, otherwise downloads and verifies the complete vinext tarball recorded in `package-lock.json`, limits npm to one socket, and terminates a stalled install. `build` uses a cross-platform Node.js wrapper, applies a short timeout, and verifies the deployable output. The dependency installation helper targets Linux and uses `flock`, `curl`, `sha256sum`, and GNU `timeout`; it is not a native Windows or macOS script.
 
 Scripts that need writable project-scoped home, npm, XDG, and temporary paths use `scripts/sites-env.sh`. The `dev` and `start` scripts honor the caller's runtime environment and keep Wrangler logs inside the checkout. The generated `.sites-runtime/` directory is disposable and ignored by Git.
 
