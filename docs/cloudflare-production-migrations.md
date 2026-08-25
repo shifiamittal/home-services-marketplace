@@ -5,6 +5,12 @@ database bootstrap. It is not a general ongoing migration system. It reads the
 `CLOUDFLARE_API_TOKEN` GitHub Actions secret and never deploys a Worker or
 changes R2, secrets, Workers.dev, preview URLs, or provider settings.
 
+Before using the workflow, create a protected GitHub Environment named exactly
+`production` and restrict it to the `main` branch. Store
+`CLOUDFLARE_API_TOKEN` only as a secret in that environment. Never store or
+duplicate the production token as a repository-level secret; the workflow must
+fail if the protected environment does not supply it.
+
 The reviewed migration hashes and exact table and index manifests are safety
 boundaries for this bootstrap. Any future schema change requires a separately
 reviewed update to those manifests and to the workflow's operating model.
@@ -12,7 +18,8 @@ reviewed update to those manifests and to the workflow's operating model.
 ## Run a preflight
 
 1. Open **Actions** → **Cloudflare production migrations** → **Run workflow**.
-2. Select the `main` branch.
+2. Select the `main` branch. Any dispatch against another branch is skipped
+   before the `production` environment is accessed or any workflow step runs.
 3. Choose `preflight` for **operation** and leave **confirmation** empty.
 4. Select **Run workflow** and review the authentication, pending migration,
    remote schema, ledger, row-count, and private-R2 results.
