@@ -13,7 +13,10 @@ Drizzle support.
 
 The Sites lifecycle CLI runs the locked dependency install before returning this checkout. Edit the source under `app/`, then checkpoint when a coherent milestone is ready to inspect or share. The remote Sites builder runs `npm run build` against the pushed commit. Do not repeat install or build as a normal pre-checkpoint step.
 
-This starter does not use `wrangler.jsonc`.
+The default `npm run build` remains compatible with the existing Sites project.
+Independent Cloudflare production commands use `wrangler.jsonc` through the
+dedicated `build:production` and `cloudflare:*` scripts; see
+`docs/cloudflare-production-environment.md`.
 
 `install:ci` is intentionally a single, non-retrying `npm ci`. It refuses a concurrent install for the same project, consumes a matching image-seeded npm cache with `--prefer-offline` while retaining registry fallback for a missing cache object, otherwise downloads and verifies the complete vinext tarball recorded in `package-lock.json`, limits npm to one socket, and terminates a stalled install. `build` applies a short timeout. These helpers target Linux and use GNU `timeout`; they are not native macOS scripts.
 
@@ -96,6 +99,13 @@ actions tied to the current ChatGPT user. Leave public content anonymous.
 - `npm run start`: start the built Vinext application
 - `npm test`: build and verify the rendered development-preview metadata
 - `npm run db:generate`: generate Drizzle migrations after schema changes
+- `npm run build:production`: build the independent Cloudflare production artifact
+- `npm run cloudflare:types`: regenerate Wrangler binding and runtime types
+- `npm run cloudflare:validate`: verify generated types and TypeScript
+- `npm run cloudflare:deploy:dry-run`: build and validate without uploading
+- `npm run cloudflare:d1:migrations:list`: list unapplied production D1 migrations
+- `npm run cloudflare:d1:migrations:apply`: apply production D1 migrations (destructive; approval required)
+- `npm run cloudflare:deploy`: deploy the production Worker (approval required)
 
 Use build commands for targeted diagnosis after a remote failure, not as part of the normal checkpoint path.
 

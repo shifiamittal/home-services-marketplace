@@ -10,7 +10,7 @@ export async function POST(request: Request) {
     if (!session) return Response.json({ error: "Sign in again to continue." }, { status: 401 });
     if (!session.roles.includes("provider")) return Response.json({ error: "A home helper account is required." }, { status: 403 });
     const { env } = await import("cloudflare:workers");
-    const bucket = (env as unknown as { BUCKET?: R2Bucket }).BUCKET;
+    const bucket = env.BUCKET;
     if (!bucket) return Response.json({ error: "Private document storage is unavailable." }, { status: 503 });
 
     const form = await request.formData();
