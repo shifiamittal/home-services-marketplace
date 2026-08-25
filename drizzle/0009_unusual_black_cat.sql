@@ -1,0 +1,1 @@
+ALTER TABLE `helper_profiles` ADD `upi_id` text;
