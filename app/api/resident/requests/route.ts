@@ -1,6 +1,7 @@
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
+import { expirePendingRequests, insertSlotClaims, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 type Service = "house_cleaning" | "utensils_once" | "utensils_twice" | "house_plus_utensils_once" | "house_plus_utensils_twice";
 type HomeSize = "one_two_bhk" | "three_bhk" | "four_plus_bhk";
@@ -54,17 +55,11 @@ async function requireResident(request: Request) {
   return session;
 }
 
-async function expirePending(db: D1Database) {
-  await db.prepare(
-    "UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND response_due_at <= CURRENT_TIMESTAMP",
-  ).run();
-}
-
 export async function GET(request: Request) {
   try {
     const session = await requireResident(request);
     const db = await getD1();
-    await expirePending(db);
+    await expirePendingRequests(db);
     const payment = await db.prepare(
       `SELECT tp.id, tp.amount_paise, tp.status, tp.transaction_reference, tp.resident_marked_paid_at,
               u.name AS helper_name, u.mobile_e164 AS helper_mobile
@@ -172,7 +167,7 @@ export async function POST(request: Request) {
     }
 
     const db = await getD1();
-    await expirePending(db);
+    await expirePendingRequests(db);
     const unpaidTrial = await db.prepare(
       `SELECT id FROM trial_payments WHERE resident_user_id = ?
        AND status IN ('pending', 'resident_marked_paid') LIMIT 1`,
@@ -242,6 +237,11 @@ export async function POST(request: Request) {
          (id, resident_user_id, helper_user_id, resident_address_id, package_snapshot_json, monthly_price_paise, requested_start_date, status, response_due_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
       ).bind(requestId, session.user_id, helperId, address.id, JSON.stringify(snapshot), monthlyPricePaise, requestedStartDate, responseDueAt),
+      insertSlotClaims(db, helperId, requestId, requestedSlots.map(slot => ({
+        dayOfWeek: slot.dayOfWeek,
+        start: slot.start,
+        end: slot.end,
+      }))),
     ];
     for (const slot of requestedSlots) {
       statements.push(db.prepare(
@@ -255,13 +255,14 @@ export async function POST(request: Request) {
         .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ requestId, helperId, service, responseDueAt })),
       db.prepare(
         `INSERT INTO notification_log
-         (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, status)
-         VALUES (?, ?, 'in_app', 'new_booking_request', 'New booking request', ?, 'incoming', 'booking_request', ?, 'delivered')`,
+          (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, dedupe_key, status)
+          VALUES (?, ?, 'in_app', 'new_booking_request', 'New booking request', ?, 'incoming', 'booking_request', ?, ?, 'delivered')`,
       ).bind(
         crypto.randomUUID(),
         helperId,
         `${session.name} requested ${serviceLabel(service)} at ${needsSecond ? `${formatMinute(firstStart)} and ${formatMinute(secondStart)}` : formatMinute(firstStart)}. Respond within 24 hours.`,
         requestId,
+        `new-booking-request:${requestId}:${helperId}`,
       ),
     );
     await db.batch(statements);
@@ -274,6 +275,12 @@ export async function POST(request: Request) {
     return Response.json({ requestId, responseDueAt, status: "pending" });
   } catch (error) {
     if (error instanceof Response) return error;
+    if (isUniqueConstraintError(error)) {
+      return Response.json({ error: "This time was just booked by someone else. Please choose another match." }, { status: 409 });
+    }
+    if (error instanceof Error && error.message.includes("travel buffer")) {
+      return Response.json({ error: "The selected times overlap after the required travel buffer." }, { status: 400 });
+    }
     return Response.json({ error: "We could not create the booking request. Please try again." }, { status: 500 });
   }
 }
@@ -285,13 +292,25 @@ export async function DELETE(request: Request) {
     const body = await request.json().catch(() => ({})) as Record<string, unknown>;
     const requestId = typeof body.requestId === "string" ? body.requestId : "";
     const db = await getD1();
-    const result = await db.prepare(
-      `UPDATE booking_requests SET status = 'withdrawn', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ? AND resident_user_id = ? AND status = 'pending'`,
-    ).bind(requestId, session.user_id).run();
-    if (!result.meta.changes) return Response.json({ error: "This request can no longer be withdrawn." }, { status: 409 });
-    await db.prepare("INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'booking_request_withdrawn', ?)")
-      .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ requestId })).run();
+    const pending = await db.prepare(
+      "SELECT id FROM booking_requests WHERE id = ? AND resident_user_id = ? AND status = 'pending' LIMIT 1",
+    ).bind(requestId, session.user_id).first<{ id: string }>();
+    if (!pending) return Response.json({ error: "This request can no longer be withdrawn." }, { status: 409 });
+    try {
+      await db.batch([
+        transitionGuard(db, "booking_request", requestId, "pending", "withdrawn", session.user_id),
+        db.prepare(
+          `UPDATE booking_requests SET status = 'withdrawn', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND resident_user_id = ? AND status = 'pending'`,
+        ).bind(requestId, session.user_id),
+        db.prepare("DELETE FROM slot_claims WHERE request_id = ? AND booking_id IS NULL").bind(requestId),
+        db.prepare("INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'booking_request_withdrawn', ?)")
+          .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ requestId })),
+      ]);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) return Response.json({ error: "This request can no longer be withdrawn." }, { status: 409 });
+      throw error;
+    }
     return Response.json({ withdrawn: true });
   } catch (error) {
     if (error instanceof Response) return error;

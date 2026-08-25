@@ -1,4 +1,5 @@
 import { assertSameOrigin, getD1, getSession } from "../../lib/auth";
+import { allocateIssueStatements } from "../../lib/issues";
 
 const residentCategories = new Set([
   "Helper did not arrive",
@@ -42,24 +43,27 @@ export async function POST(request: Request) {
       reportedUserId = session.user_id === booking.resident_user_id ? booking.helper_user_id : booking.resident_user_id;
     }
 
-    const nextCase = await db.prepare(
-      "SELECT COALESCE(MAX(case_number), 1000) + 1 AS next_case FROM issues",
-    ).first<{ next_case: number }>();
-    const caseNumber = nextCase?.next_case ?? 1001;
     const issueId = crypto.randomUUID();
     await db.batch([
-      db.prepare(
-        `INSERT INTO issues
-         (id, case_number, booking_id, reporter_user_id, reported_user_id, category, description, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'new')`,
-      ).bind(issueId, caseNumber, bookingId, session.user_id, reportedUserId, category, description || null),
+      ...allocateIssueStatements(db, {
+        id: issueId,
+        bookingId,
+        reporterUserId: session.user_id,
+        reportedUserId,
+        category,
+        description: description || null,
+      }),
       db.prepare(
         "INSERT INTO issue_status_history (id, issue_id, from_status, to_status, note) VALUES (?, ?, NULL, 'new', 'Submitted through the app')",
       ).bind(crypto.randomUUID(), issueId),
       db.prepare(
         "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'issue_submitted', ?)",
-      ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ issueId, caseNumber, bookingId, category })),
+      ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ issueId, bookingId, category })),
     ]);
+    const created = await db.prepare("SELECT case_number FROM issues WHERE id = ? LIMIT 1")
+      .bind(issueId).first<{ case_number: number }>();
+    if (!created) throw new Error("Issue case number allocation failed.");
+    const caseNumber = created.case_number;
     return Response.json({ submitted: true, caseNumber });
   } catch (error) {
     if (error instanceof Response) return error;

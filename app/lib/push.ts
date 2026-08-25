@@ -30,7 +30,7 @@ export async function sendPushToUser(db: D1Database, userId: string, payload: Pu
           options: { ttl: 86_400, urgency: "high" },
         },
       });
-      const response = await fetch(outgoing.endpoint, { method: "POST", headers: outgoing.headers, body: outgoing.body });
+      const response = await fetch(outgoing.endpoint, { method: "POST", headers: outgoing.headers, body: outgoing.body, redirect: "manual" });
       if (response.status === 404 || response.status === 410) {
         await db.prepare("UPDATE push_subscriptions SET status = 'revoked', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(subscription.id).run();
       } else if (response.ok) {

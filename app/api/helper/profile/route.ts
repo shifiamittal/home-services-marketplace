@@ -169,6 +169,14 @@ export async function PUT(request: Request) {
     }
 
     const db = await getD1();
+    const addressProof = await db.prepare(
+      `SELECT id FROM verification_documents
+       WHERE helper_user_id = ? AND status IN ('pending', 'verified')
+       ORDER BY created_at DESC LIMIT 1`,
+    ).bind(session.user_id).first<{ id: string }>();
+    if (!addressProof) {
+      return Response.json({ error: "Upload a valid address-proof document before publishing your profile." }, { status: 409 });
+    }
     const statements = [
       db.prepare(
         `INSERT INTO helper_profiles

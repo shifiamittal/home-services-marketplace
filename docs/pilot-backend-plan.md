@@ -46,7 +46,11 @@ Every submitted issue receives a case number and stores the booking, reporter, r
 
 ## Verification operations without an administrator UI
 
-The home helper uploads an address proof. The private file and a pending verification record are created together. For the pilot, an authorized operator reviews the file and records `verified` or `rejected` with a note and timestamp. Only the verification status is shown to residents.
+The home helper uploads an address proof. The private file and a pending “provided” record are created together. The pilot may activate a complete helper profile once a structurally valid private document exists, but residents see only “Address proof provided”; this is not presented as identity verification. A future authorization-gated review workflow may separately record `verified` or `rejected`.
+
+## Post-beta scaling item
+
+The pilot matching route currently loads active helpers, offerings, availability, reviews, and busy times into the Worker before ranking. Keep the controlled-beta population bounded. Before broader launch, move service, geographic, and availability prefiltering into indexed D1 queries, cap the candidate set, and paginate results.
 
 ## Pilot analytics events
 

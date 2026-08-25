@@ -1,5 +1,7 @@
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { sendPushToUser } from "../../../lib/push";
+import { allocateIssueStatements } from "../../../lib/issues";
+import { isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 const residentReasons = new Set([
   "Helper did not arrive",
@@ -50,10 +52,12 @@ export async function POST(request: Request) {
     const otherUserId = isResident ? booking.helper_user_id : booking.resident_user_id;
     const otherName = isResident ? booking.helper_name : booking.resident_name;
     const statements = [
-      db.prepare("UPDATE bookings SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-        .bind(booking.id),
+      transitionGuard(db, "booking", booking.id, `${booking.status}:${booking.trial_visits_completed}`, "cancelled", session.user_id),
+      db.prepare("UPDATE bookings SET status = 'cancelled', ended_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ? AND trial_visits_completed = ?")
+        .bind(booking.id, booking.status, booking.trial_visits_completed),
       db.prepare("UPDATE service_visits SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE booking_id = ? AND status = 'scheduled'")
         .bind(booking.id),
+      db.prepare("DELETE FROM slot_claims WHERE booking_id = ?").bind(booking.id),
       db.prepare("INSERT INTO booking_cancellations (id, booking_id, actor_user_id, phase, reason, feedback) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(crypto.randomUUID(), booking.id, session.user_id, duringTrial ? "trial" : "post_cycle", reason, feedback || null),
       db.prepare("INSERT INTO booking_status_history (id, booking_id, from_status, to_status, actor_user_id, reason) VALUES (?, ?, ?, 'cancelled', ?, ?)")
@@ -62,9 +66,9 @@ export async function POST(request: Request) {
         .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ bookingId, phase: duringTrial ? "trial" : "post_cycle", reason, completedTrialDays: booking.trial_visits_completed })),
       db.prepare(
         `INSERT INTO notification_log
-         (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, status)
-         VALUES (?, ?, 'in_app', 'booking_cancelled', 'Booking cancelled', ?, ?, 'booking', ?, 'delivered')`,
-      ).bind(crypto.randomUUID(), otherUserId, `${session.name} cancelled the booking. The recurring time is now available.`, isResident ? "providerDashboard" : "requirement", booking.id),
+         (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, dedupe_key, status)
+         VALUES (?, ?, 'in_app', 'booking_cancelled', 'Booking cancelled', ?, ?, 'booking', ?, ?, 'delivered')`,
+      ).bind(crypto.randomUUID(), otherUserId, `${session.name} cancelled the booking. The recurring time is now available.`, isResident ? "providerDashboard" : "requirement", booking.id, `booking-cancelled:${booking.id}:${otherUserId}`),
     ];
     const paymentId = amountPaise > 0 ? crypto.randomUUID() : null;
     if (paymentId) {
@@ -74,13 +78,21 @@ export async function POST(request: Request) {
       ).bind(paymentId, booking.id, booking.resident_user_id, booking.helper_user_id, amountPaise));
     }
     if (reason === "Safety or misconduct") {
-      const nextCase = await db.prepare("SELECT COALESCE(MAX(case_number), 1000) + 1 AS next_case FROM issues").first<{ next_case: number }>();
-      statements.push(db.prepare(
-        `INSERT INTO issues (id, case_number, booking_id, reporter_user_id, reported_user_id, category, description)
-         VALUES (?, ?, ?, ?, ?, 'Safety or misconduct', ?)`,
-      ).bind(crypto.randomUUID(), nextCase?.next_case ?? 1001, booking.id, session.user_id, otherUserId, feedback || null));
+      statements.push(...allocateIssueStatements(db, {
+        id: crypto.randomUUID(),
+        bookingId: booking.id,
+        reporterUserId: session.user_id,
+        reportedUserId: otherUserId,
+        category: "Safety or misconduct",
+        description: feedback || null,
+      }));
     }
-    await db.batch(statements);
+    try {
+      await db.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) return Response.json({ error: "This booking has already changed. Refresh and try again." }, { status: 409 });
+      throw error;
+    }
     await sendPushToUser(db, otherUserId, {
       title: "Booking cancelled",
       body: `${session.name} cancelled the booking. The recurring time is now available.`,

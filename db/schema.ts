@@ -114,7 +114,11 @@ export const bookingRequests = sqliteTable("booking_requests", {
   responseDueAt: text("response_due_at").notNull(),
   respondedAt: text("responded_at"),
   ...timestamps,
-}, table => [index("booking_requests_resident_idx").on(table.residentUserId), index("booking_requests_helper_idx").on(table.helperUserId, table.status)]);
+}, table => [
+  index("booking_requests_resident_idx").on(table.residentUserId),
+  index("booking_requests_helper_idx").on(table.helperUserId, table.status),
+  uniqueIndex("booking_requests_one_pending_per_resident").on(table.residentUserId).where(sql`${table.status} = 'pending'`),
+]);
 
 export const requestSlots = sqliteTable("request_slots", {
   id: text("id").primaryKey(),
@@ -126,6 +130,20 @@ export const requestSlots = sqliteTable("request_slots", {
   endMinute: integer("end_minute").notNull().default(0),
   includesHouseCleaning: integer("includes_house_cleaning", { mode: "boolean" }).notNull().default(false),
 }, table => [index("request_slots_request_idx").on(table.requestId), index("request_slots_time_idx").on(table.dayOfWeek, table.startMinute, table.endMinute), uniqueIndex("request_slots_held_slot_unique").on(table.availabilitySlotId, table.requestId, table.visitOrdinal)]);
+
+export const slotClaims = sqliteTable("slot_claims", {
+  id: text("id").primaryKey(),
+  helperUserId: text("helper_user_id").notNull().references(() => users.id),
+  dayOfWeek: integer("day_of_week").notNull(),
+  minuteOfDay: integer("minute_of_day").notNull(),
+  requestId: text("request_id").notNull().references(() => bookingRequests.id),
+  bookingId: text("booking_id").references(() => bookings.id),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, table => [
+  uniqueIndex("slot_claims_helper_day_minute_unique").on(table.helperUserId, table.dayOfWeek, table.minuteOfDay),
+  index("slot_claims_request_idx").on(table.requestId),
+  index("slot_claims_booking_idx").on(table.bookingId),
+]);
 
 export const bookings = sqliteTable("bookings", {
   id: text("id").primaryKey(),
@@ -160,7 +178,20 @@ export const bookingStatusHistory = sqliteTable("booking_status_history", {
   actorUserId: text("actor_user_id").references(() => users.id),
   reason: text("reason"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-}, table => [index("booking_status_history_booking_idx").on(table.bookingId)]);
+}, table => [
+  index("booking_status_history_booking_idx").on(table.bookingId),
+  uniqueIndex("booking_status_history_transition_unique").on(table.bookingId, table.toStatus),
+]);
+
+export const workflowTransitions = sqliteTable("workflow_transitions", {
+  id: text("id").primaryKey(),
+  entityType: text("entity_type").notNull(),
+  entityId: text("entity_id").notNull(),
+  fromState: text("from_state").notNull(),
+  toState: text("to_state").notNull(),
+  actorUserId: text("actor_user_id").references(() => users.id),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, table => [uniqueIndex("workflow_transitions_once_unique").on(table.entityType, table.entityId, table.fromState)]);
 
 export const serviceVisits = sqliteTable("service_visits", {
   id: text("id").primaryKey(),
@@ -174,7 +205,11 @@ export const serviceVisits = sqliteTable("service_visits", {
   helperConfirmedAt: text("helper_confirmed_at"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-}, table => [index("service_visits_booking_date_idx").on(table.bookingId, table.scheduledFor), index("service_visits_status_date_idx").on(table.status, table.scheduledFor)]);
+}, table => [
+  index("service_visits_booking_date_idx").on(table.bookingId, table.scheduledFor),
+  index("service_visits_status_date_idx").on(table.status, table.scheduledFor),
+  uniqueIndex("service_visits_slot_trial_unique").on(table.bookingSlotId, table.trialOrdinal),
+]);
 
 export const bookingCancellations = sqliteTable("booking_cancellations", {
   id: text("id").primaryKey(),
@@ -227,6 +262,11 @@ export const issues = sqliteTable("issues", {
   ...timestamps,
 }, table => [uniqueIndex("issues_case_number_unique").on(table.caseNumber), index("issues_status_created_idx").on(table.status, table.createdAt)]);
 
+export const issueCaseCounter = sqliteTable("issue_case_counter", {
+  id: integer("id").primaryKey(),
+  nextCaseNumber: integer("next_case_number").notNull(),
+});
+
 export const issueStatusHistory = sqliteTable("issue_status_history", {
   id: text("id").primaryKey(),
   issueId: text("issue_id").notNull().references(() => issues.id),
@@ -277,10 +317,15 @@ export const notificationLog = sqliteTable("notification_log", {
   actionView: text("action_view"),
   relatedEntityType: text("related_entity_type"),
   relatedEntityId: text("related_entity_id"),
+  dedupeKey: text("dedupe_key"),
   providerMessageId: text("provider_message_id"),
   status: text("status", { enum: ["queued", "sent", "delivered", "failed"] }).notNull().default("queued"),
   errorCode: text("error_code"),
   readAt: text("read_at"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-}, table => [index("notification_log_user_idx").on(table.userId), index("notification_log_status_idx").on(table.status)]);
+}, table => [
+  index("notification_log_user_idx").on(table.userId),
+  index("notification_log_status_idx").on(table.status),
+  uniqueIndex("notification_log_dedupe_unique").on(table.dedupeKey),
+]);

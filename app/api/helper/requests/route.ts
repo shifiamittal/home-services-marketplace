@@ -2,6 +2,7 @@ import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
 import { serviceCompletionAvailableAt } from "../../../lib/service-time";
+import { expirePendingRequests, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 function formatMinute(value: number) {
   return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
@@ -30,12 +31,6 @@ async function requireHelper(request: Request) {
   if (!session) throw Response.json({ error: "Sign in again to continue." }, { status: 401 });
   if (!session.roles.includes("provider")) throw Response.json({ error: "A home helper account is required." }, { status: 403 });
   return session;
-}
-
-async function expirePending(db: D1Database) {
-  await db.prepare(
-    "UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND response_due_at <= CURRENT_TIMESTAMP",
-  ).run();
 }
 
 async function requestDetails(db: D1Database, requestId: string, revealContact: boolean) {
@@ -131,7 +126,7 @@ export async function GET(request: Request) {
   try {
     const session = await requireHelper(request);
     const db = await getD1();
-    await expirePending(db);
+    await expirePendingRequests(db);
     const pending = await db.prepare(
       `SELECT id FROM booking_requests
        WHERE helper_user_id = ? AND status = 'pending' AND response_due_at > CURRENT_TIMESTAMP
@@ -178,7 +173,7 @@ export async function POST(request: Request) {
     const decision = body.decision === "accept" ? "accept" : body.decision === "decline" ? "decline" : "";
     if (!requestId || !decision) return Response.json({ error: "Choose accept or decline." }, { status: 400 });
     const db = await getD1();
-    await expirePending(db);
+    await expirePendingRequests(db);
     const item = await db.prepare(
       `SELECT br.id, br.resident_user_id, br.status, br.response_due_at, br.package_snapshot_json,
               br.requested_start_date, u.name AS resident_name, u.mobile_e164 AS resident_mobile
@@ -191,22 +186,30 @@ export async function POST(request: Request) {
 
     if (decision === "decline") {
       const snapshot = JSON.parse(item.package_snapshot_json) as { service?: string };
-      await db.batch([
+      try {
+        await db.batch([
+        transitionGuard(db, "booking_request", requestId, "pending", "declined", session.user_id),
         db.prepare("UPDATE booking_requests SET status = 'declined', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND helper_user_id = ? AND status = 'pending'")
           .bind(requestId, session.user_id),
+        db.prepare("DELETE FROM slot_claims WHERE request_id = ? AND booking_id IS NULL").bind(requestId),
         db.prepare("INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'booking_request_declined', ?)")
           .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ requestId })),
         db.prepare(
           `INSERT INTO notification_log
-           (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, status)
-           VALUES (?, ?, 'in_app', 'booking_request_declined', 'Choose another home helper', ?, 'requirement', 'booking_request', ?, 'delivered')`,
+           (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, dedupe_key, status)
+           VALUES (?, ?, 'in_app', 'booking_request_declined', 'Choose another home helper', ?, 'requirement', 'booking_request', ?, ?, 'delivered')`,
         ).bind(
           crypto.randomUUID(),
           item.resident_user_id,
           `${session.name} was unavailable for your ${packageLabel(snapshot.service)} request. Your held time is available again.`,
           requestId,
+          `booking-request-declined:${requestId}:${item.resident_user_id}`,
         ),
-      ]);
+        ]);
+      } catch (error) {
+        if (isUniqueConstraintError(error)) return Response.json({ error: "This request is no longer awaiting a response." }, { status: 409 });
+        throw error;
+      }
       await sendPushToUser(db, item.resident_user_id, {
         title: "Choose another home helper",
         body: `${session.name} was unavailable for your request.`,
@@ -227,6 +230,7 @@ export async function POST(request: Request) {
     ).bind(requestId).all<{ availability_slot_id: string; visit_ordinal: number; day_of_week: number; start_minute: number; end_minute: number }>();
     if (!slots.results.length) return Response.json({ error: "The held time could not be found." }, { status: 409 });
     const statements = [
+      transitionGuard(db, "booking_request", requestId, "pending", "accepted", session.user_id),
       db.prepare("UPDATE booking_requests SET status = 'accepted', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND helper_user_id = ? AND status = 'pending'")
         .bind(requestId, session.user_id),
       db.prepare(
@@ -236,6 +240,8 @@ export async function POST(request: Request) {
       ).bind(bookingId, requestId, item.resident_user_id, session.user_id, cycleStartedAt, cycleEndsAt),
       db.prepare("INSERT INTO booking_status_history (id, booking_id, from_status, to_status, actor_user_id, reason) VALUES (?, ?, NULL, 'trial', ?, 'helper_accepted_request')")
         .bind(crypto.randomUUID(), bookingId, session.user_id),
+      db.prepare("UPDATE slot_claims SET booking_id = ? WHERE request_id = ? AND booking_id IS NULL")
+        .bind(bookingId, requestId),
     ];
     const bookedSlots: Array<{ id: string; dayOfWeek: number; visitOrdinal: number; startMinute: number }> = [];
     for (const slot of slots.results) {
@@ -263,16 +269,22 @@ export async function POST(request: Request) {
         .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ requestId, bookingId })),
       db.prepare(
         `INSERT INTO notification_log
-         (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, status)
-         VALUES (?, ?, 'in_app', 'booking_confirmed', 'Booking confirmed', ?, 'confirmed', 'booking', ?, 'delivered')`,
+          (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, dedupe_key, status)
+          VALUES (?, ?, 'in_app', 'booking_confirmed', 'Booking confirmed', ?, 'confirmed', 'booking', ?, ?, 'delivered')`,
       ).bind(
         crypto.randomUUID(),
         item.resident_user_id,
         `${session.name} accepted your ${packageLabel((JSON.parse(item.package_snapshot_json) as { service?: string }).service)} request. Your recurring time is now booked.`,
         bookingId,
+        `booking-confirmed:${bookingId}:${item.resident_user_id}`,
       ),
     );
-    await db.batch(statements);
+    try {
+      await db.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) return Response.json({ error: "This request is no longer awaiting a response." }, { status: 409 });
+      throw error;
+    }
     await sendPushToUser(db, item.resident_user_id, {
       title: "Booking confirmed",
       body: `${session.name} accepted your request. Your recurring time is now booked.`,

@@ -1,6 +1,7 @@
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { sendPushToUser } from "../../../lib/push";
 import { indiaLocalDateMinuteToUtcMs } from "../../../lib/service-time";
+import { isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 export async function POST(request: Request) {
   try {
@@ -38,11 +39,14 @@ export async function POST(request: Request) {
       return Response.json({ error: `This service day can be marked complete after the final visit ends at ${availableAt}.` }, { status: 409 });
     }
     const nextStatus = trialOrdinal === 2 ? "active" : "trial";
-    const statements = visits.results.map(visit => db.prepare(
+    const statements = [
+      transitionGuard(db, "booking", bookingId, `trial:${booking.trial_visits_completed}`, `${nextStatus}:${trialOrdinal}`, session.user_id),
+      ...visits.results.map(visit => db.prepare(
       `UPDATE service_visits SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
        helper_confirmed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND status = 'scheduled'`,
-    ).bind(visit.id));
+      ).bind(visit.id)),
+    ];
     statements.push(db.prepare(
       `UPDATE bookings SET trial_visits_completed = ?, status = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id = ? AND status = 'trial' AND trial_visits_completed = ?`,
@@ -55,11 +59,16 @@ export async function POST(request: Request) {
         .bind(crypto.randomUUID(), session.user_id, JSON.stringify({ bookingId, trialOrdinal })),
       db.prepare(
         `INSERT INTO notification_log
-         (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, status)
-         VALUES (?, ?, 'in_app', 'trial_service_completed', ?, ?, 'dashboard', 'booking', ?, 'delivered')`,
-      ).bind(crypto.randomUUID(), booking.resident_user_id, `Trial service day ${trialOrdinal} completed`, trialOrdinal === 2 ? "The paid trial is complete. Your booking now continues through the 30-day service period." : "Your home helper marked the first paid trial service day complete.", bookingId),
+          (id, user_id, channel, template_key, title, body, action_view, related_entity_type, related_entity_id, dedupe_key, status)
+          VALUES (?, ?, 'in_app', 'trial_service_completed', ?, ?, 'dashboard', 'booking', ?, ?, 'delivered')`,
+      ).bind(crypto.randomUUID(), booking.resident_user_id, `Trial service day ${trialOrdinal} completed`, trialOrdinal === 2 ? "The paid trial is complete. Your booking now continues through the 30-day service period." : "Your home helper marked the first paid trial service day complete.", bookingId, `trial-service-completed:${bookingId}:${trialOrdinal}:${booking.resident_user_id}`),
     );
-    await db.batch(statements);
+    try {
+      await db.batch(statements);
+    } catch (error) {
+      if (isUniqueConstraintError(error)) return Response.json({ error: "This service day has already been completed or the booking changed." }, { status: 409 });
+      throw error;
+    }
     await sendPushToUser(db, booking.resident_user_id, {
       title: `Trial service day ${trialOrdinal} completed`,
       body: trialOrdinal === 2 ? "Your booking now continues through the 30-day service period." : "Your first paid trial service day is complete.",

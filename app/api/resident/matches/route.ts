@@ -263,7 +263,7 @@ export async function POST(request: Request) {
         distanceKm: Math.round(distanceKm * 10) / 10,
         withinTravelPreference,
         yearsExperience: helper.years_experience,
-        identityVerified: helper.verification_status === "verified",
+        addressProofProvided: helper.verification_status === "pending" || helper.verification_status === "verified",
         averageRating: averageRating == null ? null : Math.round(averageRating * 10) / 10,
         reviewCount: Number(review?.review_count ?? 0),
         score,
