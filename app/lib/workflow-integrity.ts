@@ -54,32 +54,33 @@ export const PENDING_EXPIRY_BATCH_LIMIT = 50;
 
 const expiryCandidates = `
   SELECT id FROM booking_requests
-  WHERE status = 'pending' AND response_due_at <= CURRENT_TIMESTAMP
+  WHERE status = 'pending' AND response_due_at <= ?
   ORDER BY response_due_at ASC, created_at ASC, id ASC
   LIMIT ?
 `;
 
-export function pendingExpiryStatements(db: D1Database) {
+export function pendingExpiryStatements(db: D1Database, cutoff: string) {
   return [
     db.prepare(
       `WITH expiry_candidates AS (${expiryCandidates})
        INSERT INTO workflow_transitions (id, entity_type, entity_id, from_state, to_state, actor_user_id)
        SELECT 'booking-request-expired:' || id, 'booking_request', id, 'pending', 'expired', NULL
        FROM expiry_candidates`,
-    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+    ).bind(cutoff, PENDING_EXPIRY_BATCH_LIMIT),
     db.prepare(
       `WITH expiry_candidates AS (${expiryCandidates})
        DELETE FROM slot_claims
        WHERE booking_id IS NULL AND request_id IN (SELECT id FROM expiry_candidates)`,
-    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+    ).bind(cutoff, PENDING_EXPIRY_BATCH_LIMIT),
     db.prepare(
       `WITH expiry_candidates AS (${expiryCandidates})
        UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP
        WHERE status = 'pending' AND id IN (SELECT id FROM expiry_candidates)`,
-    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+    ).bind(cutoff, PENDING_EXPIRY_BATCH_LIMIT),
   ];
 }
 
 export async function expirePendingRequests(db: D1Database) {
-  await db.batch(pendingExpiryStatements(db));
+  const cutoff = new Date().toISOString();
+  await db.batch(pendingExpiryStatements(db, cutoff));
 }

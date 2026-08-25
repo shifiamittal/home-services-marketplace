@@ -12,6 +12,7 @@ class D1TestAdapter {
     this.database = database;
     this.preparedCount = 0;
     this.beforeBatch = null;
+    this.beforeStatement = null;
   }
 
   prepare(sql) {
@@ -24,7 +25,11 @@ class D1TestAdapter {
     this.beforeBatch = null;
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const results = statements.map(statement => this.database.prepare(statement.sql).run(...statement.parameters));
+      const results = [];
+      for (const [index, statement] of statements.entries()) {
+        this.beforeStatement?.(index, statement);
+        results.push(this.database.prepare(statement.sql).run(...statement.parameters));
+      }
       this.database.exec("COMMIT");
       return results;
     } catch (error) {
@@ -134,4 +139,40 @@ test("a request transitioned before the transactional batch is not expired or re
   assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'expired-02'").get().status, "expired");
   assert.equal(count(database, "slot_claims", "request_id = 'expired-02'"), 0);
   assert.equal(count(database, "workflow_transitions"), 2);
+});
+
+test("all statements retain one cutoff when a request deadline passes during the batch", async () => {
+  const { database, d1 } = setup();
+  addRequest(database, "expired-01");
+  const crossingDeadline = new Date(Date.now() + 1_000).toISOString();
+  database.prepare(
+    "INSERT INTO booking_requests VALUES (?, 'pending', ?, ?, ?)",
+  ).run("crossing-02", crossingDeadline, "2000-01-01 00:00:02", "2000-01-01 00:00:00");
+  database.prepare("INSERT INTO slot_claims VALUES (?, ?, NULL)").run("claim-crossing-02", "crossing-02");
+
+  const cutoffs = [];
+  let advancedPastDeadline = false;
+  d1.beforeStatement = (index, statement) => {
+    cutoffs.push(statement.parameters[0]);
+    if (index === 1 && !advancedPastDeadline) {
+      const until = new Date(crossingDeadline).getTime() + 20;
+      while (Date.now() < until) { /* advance past the crossing request's deadline */ }
+      advancedPastDeadline = true;
+    }
+  };
+  await expirePendingRequests(d1);
+
+  assert.equal(new Set(cutoffs).size, 1);
+  assert.ok(cutoffs[0] < crossingDeadline);
+  assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'expired-01'").get().status, "expired");
+  assert.equal(count(database, "slot_claims", "request_id = 'expired-01'"), 0);
+  assert.equal(count(database, "workflow_transitions", "entity_id = 'expired-01'"), 1);
+  assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'crossing-02'").get().status, "pending");
+  assert.equal(count(database, "slot_claims", "request_id = 'crossing-02'"), 1);
+  assert.equal(count(database, "workflow_transitions", "entity_id = 'crossing-02'"), 0);
+
+  await expirePendingRequests(d1);
+  assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'crossing-02'").get().status, "expired");
+  assert.equal(count(database, "slot_claims", "request_id = 'crossing-02'"), 0);
+  assert.equal(count(database, "workflow_transitions", "entity_id = 'crossing-02'"), 1);
 });
