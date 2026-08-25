@@ -9,10 +9,17 @@
     "install:ci": "bash scripts/install-ci.sh",
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vite",
     "build": "bash scripts/build-verified.sh",
+    "build:production": "bash scripts/cloudflare-production.sh build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate"
+    "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern .next --ignore-pattern '.wrangler/**'",
+    "db:generate": "bash scripts/sites-env.sh -- drizzle-kit generate",
+    "cloudflare:types": "bash scripts/cloudflare-production.sh types",
+    "cloudflare:validate": "bash scripts/cloudflare-production.sh validate",
+    "cloudflare:deploy:dry-run": "bash scripts/cloudflare-production.sh dry-run",
+    "cloudflare:d1:migrations:list": "bash scripts/cloudflare-production.sh migrations-list",
+    "cloudflare:d1:migrations:apply": "bash scripts/cloudflare-production.sh migrations-apply",
+    "cloudflare:deploy": "bash scripts/cloudflare-production.sh deploy"
   },
   "dependencies": {
     "@pushforge/builder": "2.0.5",
