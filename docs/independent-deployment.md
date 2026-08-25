@@ -33,6 +33,7 @@ The application is already portable to a Cloudflare account owned by Nivasa. The
 
 ## Minimum production operations
 
+- Run the controlled beta on Cloudflare Workers Paid and monitor D1 row-write usage. Minute-level slot claims are acceptable at controlled-beta volume, but should be redesigned before a broader rollout.
 - Daily D1 export or backup with a documented restore test.
 - R2 object retention and deletion policy for address proofs.
 - Error logging and alerts for OTP, booking, upload, payment-state and notification failures.

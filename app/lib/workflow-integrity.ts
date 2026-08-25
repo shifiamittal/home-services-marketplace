@@ -50,21 +50,36 @@ export function insertSlotClaims(
   ).bind(requestId, helperUserId, requestId, JSON.stringify(claims));
 }
 
+export const PENDING_EXPIRY_BATCH_LIMIT = 50;
+
+const expiryCandidates = `
+  SELECT id FROM booking_requests
+  WHERE status = 'pending' AND response_due_at <= CURRENT_TIMESTAMP
+  ORDER BY response_due_at ASC, created_at ASC, id ASC
+  LIMIT ?
+`;
+
+export function pendingExpiryStatements(db: D1Database) {
+  return [
+    db.prepare(
+      `WITH expiry_candidates AS (${expiryCandidates})
+       INSERT INTO workflow_transitions (id, entity_type, entity_id, from_state, to_state, actor_user_id)
+       SELECT 'booking-request-expired:' || id, 'booking_request', id, 'pending', 'expired', NULL
+       FROM expiry_candidates`,
+    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+    db.prepare(
+      `WITH expiry_candidates AS (${expiryCandidates})
+       DELETE FROM slot_claims
+       WHERE booking_id IS NULL AND request_id IN (SELECT id FROM expiry_candidates)`,
+    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+    db.prepare(
+      `WITH expiry_candidates AS (${expiryCandidates})
+       UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP
+       WHERE status = 'pending' AND id IN (SELECT id FROM expiry_candidates)`,
+    ).bind(PENDING_EXPIRY_BATCH_LIMIT),
+  ];
+}
+
 export async function expirePendingRequests(db: D1Database) {
-  const expired = await db.prepare(
-    "SELECT id FROM booking_requests WHERE status = 'pending' AND response_due_at <= CURRENT_TIMESTAMP",
-  ).all<{ id: string }>();
-  for (const item of expired.results) {
-    try {
-      await db.batch([
-        transitionGuard(db, "booking_request", item.id, "pending", "expired", null),
-        db.prepare(
-          "UPDATE booking_requests SET status = 'expired', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'",
-        ).bind(item.id),
-        db.prepare("DELETE FROM slot_claims WHERE request_id = ? AND booking_id IS NULL").bind(item.id),
-      ]);
-    } catch (error) {
-      if (!isUniqueConstraintError(error)) throw error;
-    }
-  }
+  await db.batch(pendingExpiryStatements(db));
 }
