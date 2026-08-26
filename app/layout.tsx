@@ -9,7 +9,7 @@ export const metadata: Metadata = {
     title: "Nivasa — Home Help Marketplace",
     description: "Trusted home help, thoughtfully matched.",
     images: [{
-      url: "https://nivasa-home-help.shifia-mittal09.chatgpt.site/og.png",
+      url: "https://nivasa-home-help.nivasa-app.workers.dev/og.png",
       width: 1731,
       height: 909,
       alt: "Nivasa — Trusted home help, thoughtfully matched.",
@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Nivasa — Home Help Marketplace",
     description: "Trusted home help, thoughtfully matched.",
-    images: ["https://nivasa-home-help.shifia-mittal09.chatgpt.site/og.png"],
+    images: ["https://nivasa-home-help.nivasa-app.workers.dev/og.png"],
   },
   icons: {
     icon: "/favicon.svg",

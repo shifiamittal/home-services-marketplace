@@ -46,6 +46,9 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    define: {
+      __NIVASA_CLOUDFLARE_PRODUCTION__: JSON.stringify(isIndependentCloudflareProduction),
+    },
     server: {
       host: "0.0.0.0",
       allowedHosts: ["terminal.local"],

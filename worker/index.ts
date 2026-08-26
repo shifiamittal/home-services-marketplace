@@ -1,6 +1,9 @@
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { productionReadinessResponse } from "./production-readiness.mjs";
+
+declare const __NIVASA_CLOUDFLARE_PRODUCTION__: boolean;
 
 // Image security config. SVG sources with .svg extension auto-skip the
 // optimization endpoint on the client side (served directly, no proxy).
@@ -10,6 +13,9 @@ import handler from "vinext/server/app-router-entry";
 
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const readiness = await productionReadinessResponse(request, env, __NIVASA_CLOUDFLARE_PRODUCTION__);
+    if (readiness) return readiness;
+
     const url = new URL(request.url);
 
     if (url.pathname === "/_vinext/image") {
