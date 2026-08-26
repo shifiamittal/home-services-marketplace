@@ -250,44 +250,19 @@ jobs:
             throw new Error('R2 privacy response was unexpected');
           }
 
-          function nextCursor(body, seen) {
-            const info = body.result_info;
-            if (!info || typeof info !== 'object' || Array.isArray(info)) {
-              throw new Error('R2 pagination metadata is missing or malformed');
-            }
-            if (typeof info.is_truncated !== 'boolean') {
-              throw new Error('R2 pagination truncation state is missing or malformed');
-            }
-            if (!info.is_truncated) return undefined;
-            if (typeof info.cursor !== 'string' || info.cursor.trim() === '') {
-              throw new Error('R2 pagination cursor is missing or malformed');
-            }
-            if (seen.has(info.cursor)) throw new Error('R2 pagination cursor repeated');
-            seen.add(info.cursor);
-            return info.cursor;
-          }
-
-          let cursor;
-          const seenCursors = new Set();
-          let objectCount = 0;
-          do {
-            const query = new URLSearchParams({ per_page: '1000' });
-            if (cursor) query.set('cursor', cursor);
-            const page = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?${query}`);
-            if (!Array.isArray(page.result)) throw new Error('R2 object-list response was unexpected');
-            objectCount += page.result.length;
-            cursor = nextCursor(page, seenCursors);
-          } while (cursor);
+          const objects = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?per_page=1`);
+          if (!Array.isArray(objects.result)) throw new Error('R2 object-list response was unexpected');
+          if (objects.result.length !== 0) throw new Error('The production R2 bucket is not empty');
 
           if (managed.result.enabled || custom.result.domains.length !== 0) {
             throw new Error('The production R2 bucket is publicly accessible');
           }
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/cloudflare-readonly-state.json`, JSON.stringify({
             r2Private: true,
-            r2ObjectCount: objectCount,
+            r2ObjectCount: 0,
           }));
           console.log(`Workers Scripts access verified (${scripts.result.length} visible).`);
-          console.log(`R2 private: yes; custom domains: 0; objects: ${objectCount}.`);
+          console.log('R2 private: yes; custom domains: 0; objects: 0.');
           NODE
 
       - name: Run complete remote preflight
@@ -628,38 +603,13 @@ jobs:
             }
             return body;
           }
-          function nextCursor(body, seen) {
-            const info = body.result_info;
-            if (!info || typeof info !== 'object' || Array.isArray(info)) {
-              throw new Error('R2 pagination metadata is missing or malformed');
-            }
-            if (typeof info.is_truncated !== 'boolean') {
-              throw new Error('R2 pagination truncation state is missing or malformed');
-            }
-            if (!info.is_truncated) return undefined;
-            if (typeof info.cursor !== 'string' || info.cursor.trim() === '') {
-              throw new Error('R2 pagination cursor is missing or malformed');
-            }
-            if (seen.has(info.cursor)) throw new Error('R2 pagination cursor repeated');
-            seen.add(info.cursor);
-            return info.cursor;
-          }
           const managed = await get(`/accounts/${accountId}/r2/buckets/${bucket}/domains/managed`);
           const custom = await get(`/accounts/${accountId}/r2/buckets/${bucket}/domains/custom`);
           if (managed.result?.enabled !== false || !Array.isArray(custom.result?.domains) || custom.result.domains.length !== 0) {
             throw new Error('R2 bucket privacy changed');
           }
-          let cursor;
-          let objectCount = 0;
-          const seenCursors = new Set();
-          do {
-            const query = new URLSearchParams({ per_page: '1000' });
-            if (cursor) query.set('cursor', cursor);
-            const page = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?${query}`);
-            if (!Array.isArray(page.result)) throw new Error('R2 object-list response was unexpected');
-            objectCount += page.result.length;
-            cursor = nextCursor(page, seenCursors);
-          } while (cursor);
-          if (objectCount !== 0) throw new Error('R2 bucket is not empty');
+          const objects = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?per_page=1`);
+          if (!Array.isArray(objects.result)) throw new Error('R2 object-list response was unexpected');
+          if (objects.result.length !== 0) throw new Error('R2 bucket is not empty');
           console.log('R2 remains private and empty.');
           NODE
