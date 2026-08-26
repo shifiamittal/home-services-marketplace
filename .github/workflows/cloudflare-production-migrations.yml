@@ -328,7 +328,7 @@ jobs:
           if (applicationTables.length > 0) {
             const sql = applicationTables.map((name) =>
               `SELECT ${quoteLiteral(name)} AS table_name, COUNT(*) AS row_count FROM ${quoteIdentifier(name)}`
-            ).join(' UNION ALL ') + ';\n';
+            ).join(';\n') + ';\n';
             fs.writeFileSync(`${temp}/preflight-row-counts.sql`, sql);
           }
           fs.writeFileSync(`${temp}/preflight-state.json`, JSON.stringify({
@@ -557,7 +557,7 @@ jobs:
           const quoteLiteral = (name) => `'${name.replaceAll("'", "''")}'`;
           const sql = expectedTables.map((name) =>
             `SELECT ${quoteLiteral(name)} AS table_name, COUNT(*) AS row_count FROM ${quoteIdentifier(name)}`
-          ).join(' UNION ALL ') + ';\n';
+          ).join(';\n') + ';\n';
           fs.writeFileSync(`${temp}/post-row-counts.sql`, sql);
           console.log(`Verified ${ledger.length} ledger entries, ${actualTables.length} tables, and ${actualIndexes.length} indexes.`);
           NODE
@@ -583,9 +583,13 @@ jobs:
           if (rows.some((row) => !Number.isSafeInteger(row.row_count) || row.row_count < 0)) {
             throw new Error('Post-apply row count is not a valid non-negative integer');
           }
-          const nonempty = rows.filter((row) => row.row_count !== 0);
-          if (nonempty.length !== 0) throw new Error('Application records exist after migration');
-          console.log(`Verified zero records across ${rows.length} application tables.`);
+          const expectedCounts = new Map(expected.map((name) => [
+            name,
+            name === 'issue_case_counter' ? 1 : 0,
+          ]));
+          const unexpectedCounts = rows.filter((row) => row.row_count !== expectedCounts.get(row.table_name));
+          if (unexpectedCounts.length !== 0) throw new Error('Application bootstrap record counts are unexpected');
+          console.log(`Verified expected bootstrap record counts across ${rows.length} application tables.`);
           NODE
 
           node --input-type=module <<'NODE'
