@@ -275,6 +275,20 @@ jobs:
             }
             return body;
           };
+          const domainEnvelope = (body, status, write) => {
+            const validBody = isNonArrayObject(body);
+            const errorsAreEmpty = validBody && Object.hasOwn(body, 'errors')
+              && (Array.isArray(body.errors)
+                ? body.errors.length === 0
+                : body.errors === null
+                  || (isNonArrayObject(body.errors)
+                    && Object.getOwnPropertyNames(body.errors).length === 0));
+            if (!validBody || body.success !== true || !errorsAreEmpty) {
+              domainEnvelopeDiagnostic(status, body, write);
+              throw new Error('Ambiguous API envelope');
+            }
+            return body;
+          };
           const workers = (body, target) => {
             envelope(body);
             if (!Array.isArray(body.result)) throw new Error('Malformed Workers result');
@@ -300,7 +314,7 @@ jobs:
             return matches[0];
           };
           const domains = (body, target, status = 200, write = () => {}) => {
-            envelope(body, { status, write });
+            domainEnvelope(body, status, write);
             if (!Array.isArray(body.result)) throw new Error('Malformed domains result');
             const info = body.result_info;
             if (info !== undefined) {
@@ -372,6 +386,16 @@ jobs:
           assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [] }, { id: 'nivasa-home-help', routes: [] }]), 'nivasa-home-help'));
           assert.throws(() => workers(ok([null]), 'nivasa-home-help'));
           assert.deepEqual(domains(ok([]), 'nivasa-home-help'), []);
+          assert.deepEqual(domains(
+            { success: true, errors: null, result: [] },
+            'nivasa-home-help', 200, () => assert.fail(),
+          ), []);
+          assert.deepEqual(domains(
+            { success: true, errors: {}, result: [] },
+            'nivasa-home-help', 200, () => assert.fail(),
+          ), []);
+          assert.throws(() => envelope({ success: true, errors: null, result: [] }));
+          assert.throws(() => envelope({ success: true, errors: {}, result: [] }));
           assert.deepEqual(domains({
             success: true, errors: [], result: [],
             result_info: { page: 1, per_page: 50, count: 0, total_count: 0, total_pages: 0 },
@@ -416,12 +440,6 @@ jobs:
           assert.equal(captureDiagnostic({ errors: [], result: [] }).successExists, false);
           assert.equal(captureDiagnostic({ success: true, result: [] }).errorsExists, false);
           assert.equal(captureDiagnostic({ success: true, errors: sentinel, result: [] }).errorsIsArray, false);
-          const nullErrors = captureDiagnostic({ success: true, errors: null, result: [] });
-          assert.equal(nullErrors.errorsIsNull, true);
-          assert.equal(nullErrors.errorsIsNonArrayObject, false);
-          const emptyObjectErrors = captureDiagnostic({ success: true, errors: {}, result: [] });
-          assert.equal(emptyObjectErrors.errorsIsNonArrayObject, true);
-          assert.equal(emptyObjectErrors.errorsObjectOwnPropertyCount, 0);
           const populatedObjectErrors = captureDiagnostic({
             success: true,
             errors: {
@@ -433,6 +451,7 @@ jobs:
           assert.equal(populatedObjectErrors.errorsIsNonArrayObject, true);
           assert.equal(populatedObjectErrors.errorsObjectOwnPropertyCount, 2);
           assert.equal(JSON.stringify(populatedObjectErrors).includes('nested'), false);
+          assert.throws(() => domains({ success: true, errors: [null], result: [] }, 'nivasa-home-help'));
           assert.equal(captureDiagnostic({ success: true, errors: sentinel, result: [] }).errorsIsString, true);
           assert.equal(captureDiagnostic({ success: true, errors: 7, result: [] }).errorsIsNumber, true);
           assert.equal(captureDiagnostic({ success: true, errors: false, result: [] }).errorsIsBoolean, true);
@@ -616,7 +635,15 @@ jobs:
             if (allowNotFound && response.status === 404) return null;
             if (!response.ok) throw new Error(`Cloudflare read failed with HTTP ${response.status}`);
             const body = await response.json();
-            if (body?.success !== true || !Array.isArray(body?.errors) || body.errors.length !== 0) {
+            const validBody = isNonArrayObject(body);
+            const strictErrorsAreEmpty = validBody && Array.isArray(body.errors) && body.errors.length === 0;
+            const domainErrorsAreEmpty = validBody && Object.hasOwn(body, 'errors')
+              && (strictErrorsAreEmpty || body.errors === null
+                || (isNonArrayObject(body.errors)
+                  && Object.getOwnPropertyNames(body.errors).length === 0));
+            const accepted = validBody && body.success === true
+              && (diagnoseCustomDomain ? domainErrorsAreEmpty : strictErrorsAreEmpty);
+            if (!accepted) {
               if (diagnoseCustomDomain) reportCustomDomainEnvelope(response.status, body);
               throw new Error('Cloudflare returned an ambiguous API envelope');
             }
