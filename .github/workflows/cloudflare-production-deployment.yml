@@ -1,17 +1,17 @@
-name: Cloudflare private production deployment
+name: Cloudflare production deployment
 
 'on':
   workflow_dispatch:
     inputs:
       operation:
-        description: Read-only preflight or guarded private Worker deployment
+        description: Read-only preflight or guarded public Workers.dev deployment
         required: true
         type: choice
         options:
           - preflight
-          - deploy-private
+          - deploy-public
       confirmation:
-        description: For deploy-private, enter DEPLOY_NIVASA_PRIVATE_WORKER
+        description: For deploy-public, enter DEPLOY_NIVASA_PUBLIC_WORKER
         required: false
         type: string
         default: ''
@@ -20,13 +20,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: nivasa-production-private-worker
+  group: nivasa-production-worker
   cancel-in-progress: false
 
 jobs:
   deploy:
     if: ${{ github.ref == 'refs/heads/main' }}
-    name: ${{ inputs.operation }} private production Worker
+    name: ${{ inputs.operation }} production Worker
     runs-on: ubuntu-latest
     timeout-minutes: 35
     environment: production
@@ -36,6 +36,7 @@ jobs:
       EXPECTED_DATABASE_NAME: nivasa-production
       EXPECTED_DATABASE_ID: 508b580c-9da0-41ad-97d2-4695047eb2b0
       EXPECTED_BUCKET_NAME: nivasa-private-address-proofs
+      EXPECTED_WORKERS_DEV_URL: https://nivasa-home-help.nivasa-app.workers.dev
     defaults:
       run:
         shell: bash --noprofile --norc -euo pipefail {0}
@@ -46,14 +47,14 @@ jobs:
           REQUESTED_OPERATION: ${{ inputs.operation }}
         run: |
           [[ "${GITHUB_REF}" == 'refs/heads/main' ]] || {
-            echo 'Private production deployment requires refs/heads/main.' >&2
+            echo 'Production deployment requires refs/heads/main.' >&2
             exit 1
           }
           [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" && "${DEFAULT_BRANCH}" == 'main' ]] || {
-            echo 'Private production deployment requires main to be the default branch.' >&2
+            echo 'Production deployment requires main to be the default branch.' >&2
             exit 1
           }
-          [[ "${REQUESTED_OPERATION}" == 'preflight' || "${REQUESTED_OPERATION}" == 'deploy-private' ]] || {
+          [[ "${REQUESTED_OPERATION}" == 'preflight' || "${REQUESTED_OPERATION}" == 'deploy-public' ]] || {
             echo 'Unexpected deployment operation.' >&2
             exit 1
           }
@@ -130,7 +131,7 @@ jobs:
             [bucket?.bucket_name, process.env.EXPECTED_BUCKET_NAME, 'R2 bucket name'],
             [config.assets?.binding, 'ASSETS', 'Assets binding'],
             [config.images?.binding, 'IMAGES', 'Images binding'],
-            [config.workers_dev, false, 'Workers.dev setting'],
+            [config.workers_dev, true, 'Workers.dev setting'],
             [config.preview_urls, false, 'preview URL setting'],
           ];
           for (const [actual, expected, label] of checks) {
@@ -148,7 +149,12 @@ jobs:
             crypto.createHash('sha256').update(source).digest('hex'),
             { mode: 0o600 },
           );
-          console.log('Immutable private production target verified.');
+          const publicUrl = new URL(process.env.EXPECTED_WORKERS_DEV_URL);
+          if (publicUrl.protocol !== 'https:' || publicUrl.hostname !== 'nivasa-home-help.nivasa-app.workers.dev'
+              || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash) {
+            throw new Error('Unexpected Workers.dev production URL');
+          }
+          console.log('Immutable public production target verified.');
           NODE
 
       - name: Run local production validation without credentials
@@ -176,7 +182,7 @@ jobs:
             [generated.name, process.env.EXPECTED_WORKER_NAME],
             [generated.account_id, process.env.EXPECTED_ACCOUNT_ID],
             [generated.main, 'index.js'],
-            [generated.workers_dev, false],
+            [generated.workers_dev, true],
             [generated.preview_urls, false],
             [generated.assets?.binding, 'ASSETS'],
             [generated.images?.binding, 'IMAGES'],
@@ -191,7 +197,7 @@ jobs:
               || !deploy.configPath.replaceAll('\\', '/').endsWith('dist/server/wrangler.json')) {
             throw new Error('Wrangler deployment redirect is unexpected');
           }
-          console.log('Generated private Worker configuration verified.');
+          console.log('Generated public Workers.dev configuration verified.');
           NODE
           artifact_hash="$(find dist .wrangler/deploy/config.json -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
           artifact_hash="${artifact_hash%% *}"
@@ -212,8 +218,8 @@ jobs:
             '',
           );
           const allowed = (ref, defaultBranch) => ref === 'refs/heads/main' && defaultBranch === 'main';
-          const confirmed = (operation, phrase) => operation !== 'deploy-private'
-            || phrase === 'DEPLOY_NIVASA_PRIVATE_WORKER';
+          const confirmed = (operation, phrase) => operation !== 'deploy-public'
+            || phrase === 'DEPLOY_NIVASA_PUBLIC_WORKER';
           const requiredNames = [
             'NIVASA_SESSION_SECRET', 'MSG91_AUTH_KEY', 'VAPID_PRIVATE_JWK',
             'NEXT_PUBLIC_MSG91_WIDGET_ID', 'NEXT_PUBLIC_MSG91_WIDGET_TOKEN',
@@ -343,9 +349,11 @@ jobs:
             }
             return body.result.items[0]?.id ?? null;
           };
-          const workerAllowed = (state, requireAllSecrets = false) => {
-            if (!state.exists) return !requireAllSecrets;
-            if (state.workersDev || state.previews || state.domains !== 0) return false;
+          const workerAllowed = (state, access, requireAllSecrets = false) => {
+            if (!state.exists) return false;
+            if (state.previews || state.domains !== 0 || !state.r2Private) return false;
+            if (access === 'private' && state.workersDev) return false;
+            if (access === 'public' && !state.workersDev) return false;
             if (!state.bindings) return false;
             const names = [...state.secrets].sort();
             if (new Set(names).size !== names.length || names.some((name) => !requiredNames.includes(name))) return false;
@@ -353,8 +361,8 @@ jobs:
           };
           assert.equal(allowed('refs/heads/main', 'main'), true);
           assert.equal(allowed('refs/heads/feature', 'main'), false);
-          assert.equal(confirmed('deploy-private', ''), false);
-          assert.equal(confirmed('deploy-private', 'DEPLOY_NIVASA_PRIVATE_WORKER'), true);
+          assert.equal(confirmed('deploy-public', ''), false);
+          assert.equal(confirmed('deploy-public', 'DEPLOY_NIVASA_PUBLIC_WORKER'), true);
           assert.equal(confirmed('preflight', ''), true);
           assert.equal(requiredNames.every((name) => ({ ...Object.fromEntries(requiredNames.map((item) => [item, 'present'])) })[name]), true);
           assert.equal(requiredNames.every((name) => ({ NIVASA_SESSION_SECRET: 'present' })[name]), false);
@@ -362,7 +370,13 @@ jobs:
             account: '0c53a1d6277d240fe99359ce0495fe9d', worker: 'nivasa-home-help',
             database: '508b580c-9da0-41ad-97d2-4695047eb2b0', bucket: 'nivasa-private-address-proofs',
           }), true);
-          assert.equal(targetMatches({ account: 'wrong', worker: 'nivasa-home-help', database: 'wrong', bucket: 'wrong' }), false);
+          const reviewedTarget = {
+            account: '0c53a1d6277d240fe99359ce0495fe9d', worker: 'nivasa-home-help',
+            database: '508b580c-9da0-41ad-97d2-4695047eb2b0', bucket: 'nivasa-private-address-proofs',
+          };
+          for (const key of Object.keys(reviewedTarget)) {
+            assert.equal(targetMatches({ ...reviewedTarget, [key]: 'wrong' }), false);
+          }
           const ok = (result) => ({ success: true, errors: [], result });
           for (const errors of [[], null, {}]) {
             assert.equal(envelope({ success: true, errors, result: [] }).success, true);
@@ -495,33 +509,35 @@ jobs:
           assert.throws(() => versions(ok({ items: [{}] })));
           assert.throws(() => versions(ok({ items: [{ id: '' }] })));
           assert.throws(() => versions(ok({ items: [{ id: 'same' }, { id: 'same' }] })));
-          const firstDeployment = { exists: false };
-          assert.equal(workerAllowed(firstDeployment), true);
-          const partialRecoveryWorker = {
-            exists: true, workersDev: false, previews: false, domains: 0, bindings: true, secrets: [],
+          assert.equal(workerAllowed({ exists: false }, 'private', true), false);
+          const reviewedPrivateWorker = {
+            exists: true, workersDev: false, previews: false, domains: 0,
+            r2Private: true, bindings: true, secrets: requiredNames,
           };
-          assert.equal(workerAllowed(partialRecoveryWorker), true);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, workersDev: true }), false);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, previews: true }), false);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, domains: 1 }), false);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: ['NIVASA_SESSION_SECRET'] }), true);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: requiredNames }, true), true);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: requiredNames.slice(1) }, true), false);
-          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: [...requiredNames, 'UNEXPECTED'] }), false);
+          assert.equal(workerAllowed(reviewedPrivateWorker, 'private', true), true);
+          const reviewedPublicWorker = { ...reviewedPrivateWorker, workersDev: true };
+          assert.equal(workerAllowed(reviewedPublicWorker, 'public', true), true);
+          assert.equal(workerAllowed(reviewedPrivateWorker, 'public', true), false);
+          assert.equal(workerAllowed({ ...reviewedPublicWorker, bindings: false }, 'public', true), false);
+          assert.equal(workerAllowed({ ...reviewedPublicWorker, previews: true }, 'public', true), false);
+          assert.equal(workerAllowed({ ...reviewedPublicWorker, domains: 1 }, 'public', true), false);
+          assert.equal(workerAllowed({ ...reviewedPublicWorker, r2Private: false }, 'public', true), false);
+          assert.equal(workerAllowed({ ...reviewedPrivateWorker, secrets: requiredNames.slice(1) }, 'private', true), false);
+          assert.equal(workerAllowed({ ...reviewedPrivateWorker, secrets: [...requiredNames, 'UNEXPECTED'] }, 'private', true), false);
           assert.match(workflow, /environment:\s*production/);
           assert.match(workflow, /if:\s*\$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler\s+d1\s+migrations\s+apply/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler\s+r2\s+object\s+(put|delete)/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler\s+(?:routes?|domains?)\s/);
-          assert.match(workflow, /\[config\.workers_dev, false, 'Workers\.dev setting'\]/);
+          assert.match(workflow, /\[config\.workers_dev, true, 'Workers\.dev setting'\]/);
           assert.match(workflow, /\[config\.preview_urls, false, 'preview URL setting'\]/);
           assert.doesNotMatch(reviewedWorkflow, /set\s+-x|ACTIONS_STEP_DEBUG|::set-output/);
           assert.doesNotMatch(reviewedWorkflow, /save-state|GITHUB_STEP_SUMMARY|upload-artifact/);
           assert.doesNotMatch(reviewedWorkflow, /console\.(log|error)\([^\n]*process\.env/);
           assert.doesNotMatch(reviewedWorkflow, /echo[^\n]*\$\{(?:CLOUDFLARE|NIVASA|MSG91|VAPID|NEXT_PUBLIC|GOOGLE)/);
           assert.match(reviewedWorkflow, /- name: Remove temporary deployment material[\s\S]*?if:\s*\$\{\{ always\(\) \}\}[\s\S]*?rm -f --/);
-          assert.match(reviewedWorkflow, /wrangler secret bulk[^\n]*< "\$\{secret_file\}"/);
-          assert.doesNotMatch(reviewedWorkflow, /wrangler secret (put|delete)|--secrets-file/);
+          assert.doesNotMatch(reviewedWorkflow, /wrangler secret (bulk|put|delete)|--secrets-file/);
+          assert.match(reviewedWorkflow, /if \[\[ "\$\{REQUESTED_OPERATION\}" == 'preflight' \]\];[\s\S]*?exit 0[\s\S]*?wrangler deploy --strict/);
           assert.match(
             reviewedWorkflow,
             /get\(\s*`\/accounts\/\$\{account\}\/workers\/domains\?service=\$\{encodeURIComponent\(worker\)\}`,\s*false,\s*true,\s*\)/,
@@ -530,52 +546,18 @@ jobs:
           console.log('Static workflow security boundaries verified.');
           NODE
 
-      - name: Require explicit private-deployment confirmation
-        if: ${{ inputs.operation == 'deploy-private' }}
+      - name: Require explicit public-deployment confirmation
+        if: ${{ inputs.operation == 'deploy-public' }}
         env:
           DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
         run: |
-          [[ "${DEPLOY_CONFIRMATION}" == 'DEPLOY_NIVASA_PRIVATE_WORKER' ]] || {
-            echo 'The exact private-deployment confirmation phrase is required.' >&2
+          [[ "${DEPLOY_CONFIRMATION}" == 'DEPLOY_NIVASA_PUBLIC_WORKER' ]] || {
+            echo 'The exact public-deployment confirmation phrase is required.' >&2
             exit 1
           }
-          echo 'Private-deployment confirmation verified.'
+          echo 'Public-deployment confirmation verified.'
 
-      - name: Validate all runtime values without logging them
-        env:
-          NIVASA_SESSION_SECRET: ${{ secrets.NIVASA_SESSION_SECRET }}
-          MSG91_AUTH_KEY: ${{ secrets.MSG91_AUTH_KEY }}
-          VAPID_PRIVATE_JWK: ${{ secrets.VAPID_PRIVATE_JWK }}
-          NEXT_PUBLIC_MSG91_WIDGET_ID: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_ID }}
-          NEXT_PUBLIC_MSG91_WIDGET_TOKEN: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_TOKEN }}
-          GOOGLE_MAPS_BROWSER_KEY: ${{ vars.GOOGLE_MAPS_BROWSER_KEY }}
-          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
-          VAPID_SUBJECT: ${{ vars.VAPID_SUBJECT }}
-        run: |
-          node --input-type=module <<'NODE'
-          import { productionConfigurationReady } from './worker/production-readiness.mjs';
-          const names = [
-            'NIVASA_SESSION_SECRET', 'MSG91_AUTH_KEY', 'VAPID_PRIVATE_JWK',
-            'NEXT_PUBLIC_MSG91_WIDGET_ID', 'NEXT_PUBLIC_MSG91_WIDGET_TOKEN',
-            'GOOGLE_MAPS_BROWSER_KEY', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
-          ];
-          if (names.some((name) => typeof process.env[name] !== 'string' || process.env[name].length === 0)) {
-            throw new Error('Required production runtime configuration is unavailable');
-          }
-          const environment = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-          Object.assign(environment, {
-            DB: { prepare() {} },
-            BUCKET: { put() {}, delete() {} },
-            ASSETS: { fetch() {} },
-            IMAGES: { input() {} },
-          });
-          if (!await productionConfigurationReady(environment)) {
-            throw new Error('Production runtime configuration failed structural validation');
-          }
-          console.log('All required runtime settings passed non-logging structural validation.');
-          NODE
-
-      - name: Authenticate, preflight, and deploy privately when requested
+      - name: Authenticate, preflight, and deploy publicly when requested
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           REQUESTED_OPERATION: ${{ inputs.operation }}
@@ -745,10 +727,18 @@ jobs:
 
           let secretNames = [];
           let versionId = null;
+          let workersDevEnabled = false;
           if (workerExists) {
             const subdomain = await get(`/accounts/${account}/workers/scripts/${worker}/subdomain`);
-            if (subdomain.result?.enabled !== false || subdomain.result?.previews_enabled !== false) {
-              throw new Error('Worker public or preview URL access is enabled');
+            if (typeof subdomain.result?.enabled !== 'boolean' || subdomain.result?.previews_enabled !== false) {
+              throw new Error('Worker subdomain or preview metadata is unexpected');
+            }
+            workersDevEnabled = subdomain.result.enabled;
+            if (process.env.REQUIRE_ACCESS_STATE === 'private' && workersDevEnabled) {
+              throw new Error('Worker is unexpectedly public');
+            }
+            if (process.env.REQUIRE_ACCESS_STATE === 'public' && !workersDevEnabled) {
+              throw new Error('Workers.dev access is not enabled');
             }
             const settings = await get(`/accounts/${account}/workers/scripts/${worker}/settings`);
             const bindings = settings.result?.bindings;
@@ -771,9 +761,9 @@ jobs:
           if (process.env.REQUIRE_WORKER === '1' && !workerExists) throw new Error('Expected Worker does not exist');
           if (process.env.REQUIRE_ALL_SECRETS === '1'
               && JSON.stringify(secretNames) !== JSON.stringify(expectedSecrets)) throw new Error('Expected Worker secret names are incomplete');
-          const state = { workerExists, secretNames, versionId, privateAccess: true, r2Private: true };
+          const state = { workerExists, secretNames, versionId, workersDevEnabled, previewsEnabled: false, r2Private: true };
           fs.writeFileSync(process.env.STATE_PATH, JSON.stringify(state), { mode: 0o600 });
-          console.log(workerExists ? 'Existing exact private Worker state verified.' : 'No conflicting Worker exists.');
+          console.log(workerExists ? 'Existing exact Worker state verified.' : 'No conflicting Worker exists.');
           NODE
           chmod 600 "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
 
@@ -811,12 +801,12 @@ jobs:
             node "${RUNNER_TEMP}/nivasa-validate-d1.cjs"
           }
 
-          STATE_PATH="${RUNNER_TEMP}/nivasa-preflight-state.json" REQUIRE_WORKER=0 REQUIRE_ALL_SECRETS=0 \
+          STATE_PATH="${RUNNER_TEMP}/nivasa-preflight-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 REQUIRE_ACCESS_STATE=either \
             node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
           run_d1_checks
 
           if [[ "${REQUESTED_OPERATION}" == 'preflight' ]]; then
-            echo 'Read-only private deployment preflight completed.'
+            echo 'Read-only production deployment preflight completed.'
             exit 0
           fi
 
@@ -842,7 +832,7 @@ jobs:
             echo 'The production artifact changed after validation.' >&2
             exit 1
           }
-          STATE_PATH="${RUNNER_TEMP}/nivasa-fresh-state.json" REQUIRE_WORKER=0 REQUIRE_ALL_SECRETS=0 \
+          STATE_PATH="${RUNNER_TEMP}/nivasa-fresh-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 REQUIRE_ACCESS_STATE=either \
             node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
           cmp --silent "${RUNNER_TEMP}/nivasa-preflight-state.json" "${RUNNER_TEMP}/nivasa-fresh-state.json" || {
             echo 'Remote Worker state changed after preflight.' >&2
@@ -850,68 +840,16 @@ jobs:
           }
           run_d1_checks
           ./node_modules/.bin/wrangler deploy --strict
-          STATE_PATH="${RUNNER_TEMP}/nivasa-post-deploy-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=0 \
+          STATE_PATH="${RUNNER_TEMP}/nivasa-post-deploy-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 REQUIRE_ACCESS_STATE=public \
             node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
-          echo 'Exact Worker artifact deployed with public and preview access disabled.'
+          echo 'Exact Worker artifact deployed with Workers.dev enabled and previews disabled.'
 
-      - name: Install runtime values as Worker secrets
-        if: ${{ inputs.operation == 'deploy-private' }}
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          NIVASA_SESSION_SECRET: ${{ secrets.NIVASA_SESSION_SECRET }}
-          MSG91_AUTH_KEY: ${{ secrets.MSG91_AUTH_KEY }}
-          VAPID_PRIVATE_JWK: ${{ secrets.VAPID_PRIVATE_JWK }}
-          NEXT_PUBLIC_MSG91_WIDGET_ID: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_ID }}
-          NEXT_PUBLIC_MSG91_WIDGET_TOKEN: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_TOKEN }}
-          GOOGLE_MAPS_BROWSER_KEY: ${{ vars.GOOGLE_MAPS_BROWSER_KEY }}
-          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
-          VAPID_SUBJECT: ${{ vars.VAPID_SUBJECT }}
-        run: |
-          secret_file="${RUNNER_TEMP}/nivasa-worker-secrets.json"
-          trap 'rm -f -- "${secret_file}"' EXIT
-          umask 077
-          node --input-type=module <<'NODE'
-          import fs from 'node:fs';
-          import { productionConfigurationReady } from './worker/production-readiness.mjs';
-          const names = [
-            'GOOGLE_MAPS_BROWSER_KEY', 'MSG91_AUTH_KEY', 'NEXT_PUBLIC_MSG91_WIDGET_ID',
-            'NEXT_PUBLIC_MSG91_WIDGET_TOKEN', 'NIVASA_SESSION_SECRET',
-            'VAPID_PRIVATE_JWK', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
-          ];
-          if (names.some((name) => typeof process.env[name] !== 'string' || process.env[name].length === 0)) {
-            throw new Error('Required runtime configuration is unavailable');
-          }
-          const environment = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-          Object.assign(environment, {
-            DB: { prepare() {} },
-            BUCKET: { put() {}, delete() {} },
-            ASSETS: { fetch() {} },
-            IMAGES: { input() {} },
-          });
-          if (!await productionConfigurationReady(environment)) {
-            throw new Error('Production runtime configuration failed fresh structural validation');
-          }
-          fs.writeFileSync(
-            `${process.env.RUNNER_TEMP}/nivasa-worker-secrets.json`,
-            JSON.stringify(Object.fromEntries(names.map((name) => [name, process.env[name]]))),
-            { mode: 0o600 },
-          );
-          NODE
-          [[ "$(stat -c '%a' "${secret_file}")" == '600' ]] || {
-            echo 'Temporary secret file permissions are unsafe.' >&2
-            exit 1
-          }
-          ./node_modules/.bin/wrangler secret bulk --name "${EXPECTED_WORKER_NAME}" --config wrangler.jsonc < "${secret_file}"
-          rm -f -- "${secret_file}"
-          trap - EXIT
-          echo 'Eight runtime setting names were installed as encrypted Worker secrets.'
-
-      - name: Verify final private deployment
-        if: ${{ inputs.operation == 'deploy-private' }}
+      - name: Verify final public deployment
+        if: ${{ inputs.operation == 'deploy-public' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          STATE_PATH="${RUNNER_TEMP}/nivasa-final-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 \
+          STATE_PATH="${RUNNER_TEMP}/nivasa-final-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 REQUIRE_ACCESS_STATE=public \
             node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
           ./node_modules/.bin/wrangler d1 migrations list DB --config wrangler.jsonc --remote \
             > "${RUNNER_TEMP}/nivasa-final-pending.txt"
@@ -938,14 +876,16 @@ jobs:
           if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Final D1 migration ledger is unexpected');
           NODE
           version_id="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(!s.versionId)process.exit(1); process.stdout.write(s.versionId)")"
-          echo "Verified private Worker version: ${version_id}"
-          echo 'Final Worker bindings, secret names, D1 ledger, R2 privacy, and absence of public URLs verified.'
+          expected_url="${EXPECTED_WORKERS_DEV_URL}"
+          [[ "${expected_url}" == 'https://nivasa-home-help.nivasa-app.workers.dev' ]] || exit 1
+          echo "Verified public Worker version: ${version_id}"
+          echo "Workers.dev production URL verified: ${expected_url}"
+          echo 'Final Worker bindings, secret names, D1 ledger, R2 privacy, Workers.dev access, and preview isolation verified.'
 
       - name: Remove temporary deployment material
         if: ${{ always() }}
         run: |
           rm -f -- \
-            "${RUNNER_TEMP}/nivasa-worker-secrets.json" \
             "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs" \
             "${RUNNER_TEMP}/nivasa-validate-d1.cjs" \
             "${RUNNER_TEMP}/nivasa-reviewed-config.sha256" \
