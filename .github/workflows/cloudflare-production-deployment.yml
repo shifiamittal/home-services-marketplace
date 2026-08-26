@@ -1,0 +1,609 @@
+name: Cloudflare private production deployment
+
+'on':
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Read-only preflight or guarded private Worker deployment
+        required: true
+        type: choice
+        options:
+          - preflight
+          - deploy-private
+      confirmation:
+        description: For deploy-private, enter DEPLOY_NIVASA_PRIVATE_WORKER
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nivasa-production-private-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    name: ${{ inputs.operation }} private production Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: production
+    env:
+      EXPECTED_ACCOUNT_ID: 0c53a1d6277d240fe99359ce0495fe9d
+      EXPECTED_WORKER_NAME: nivasa-home-help
+      EXPECTED_DATABASE_NAME: nivasa-production
+      EXPECTED_DATABASE_ID: 508b580c-9da0-41ad-97d2-4695047eb2b0
+      EXPECTED_BUCKET_NAME: nivasa-private-address-proofs
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Verify default production branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REQUESTED_OPERATION: ${{ inputs.operation }}
+        run: |
+          [[ "${GITHUB_REF}" == 'refs/heads/main' ]] || {
+            echo 'Private production deployment requires refs/heads/main.' >&2
+            exit 1
+          }
+          [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" && "${DEFAULT_BRANCH}" == 'main' ]] || {
+            echo 'Private production deployment requires main to be the default branch.' >&2
+            exit 1
+          }
+          [[ "${REQUESTED_OPERATION}" == 'preflight' || "${REQUESTED_OPERATION}" == 'deploy-private' ]] || {
+            echo 'Unexpected deployment operation.' >&2
+            exit 1
+          }
+          echo 'Default production branch and operation verified.'
+
+      - name: Check out selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Validate revision and immutable production target
+        run: |
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]] || {
+            echo 'Checked-out revision does not match the dispatched revision.' >&2
+            exit 1
+          }
+          [[ -z "$(git status --porcelain)" ]] || {
+            echo 'The checked-out repository is not clean.' >&2
+            exit 1
+          }
+
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+
+          function stripJsonComments(source) {
+            let output = '';
+            let inString = false;
+            let escaped = false;
+            for (let index = 0; index < source.length; index += 1) {
+              const character = source[index];
+              const next = source[index + 1];
+              if (inString) {
+                output += character;
+                if (escaped) escaped = false;
+                else if (character === '\\') escaped = true;
+                else if (character === '"') inString = false;
+              } else if (character === '"') {
+                inString = true;
+                output += character;
+              } else if (character === '/' && next === '/') {
+                while (index < source.length && source[index] !== '\n') index += 1;
+                output += '\n';
+              } else if (character === '/' && next === '*') {
+                index += 2;
+                while (index < source.length && !(source[index] === '*' && source[index + 1] === '/')) index += 1;
+                if (index >= source.length) throw new Error('Unterminated JSONC block comment');
+                index += 1;
+              } else output += character;
+            }
+            if (inString) throw new Error('Unterminated JSONC string');
+            return output;
+          }
+
+          const source = fs.readFileSync('wrangler.jsonc', 'utf8');
+          const config = JSON.parse(stripJsonComments(source));
+          const database = config.d1_databases?.find((item) => item.binding === 'DB');
+          const bucket = config.r2_buckets?.find((item) => item.binding === 'BUCKET');
+          const checks = [
+            [config.name, process.env.EXPECTED_WORKER_NAME, 'Worker name'],
+            [config.account_id, process.env.EXPECTED_ACCOUNT_ID, 'account ID'],
+            [config.main, './worker/index.ts', 'Worker entry point'],
+            [database?.database_name, process.env.EXPECTED_DATABASE_NAME, 'D1 database name'],
+            [database?.database_id, process.env.EXPECTED_DATABASE_ID, 'D1 database ID'],
+            [bucket?.bucket_name, process.env.EXPECTED_BUCKET_NAME, 'R2 bucket name'],
+            [config.assets?.binding, 'ASSETS', 'Assets binding'],
+            [config.images?.binding, 'IMAGES', 'Images binding'],
+            [config.workers_dev, false, 'Workers.dev setting'],
+            [config.preview_urls, false, 'preview URL setting'],
+          ];
+          for (const [actual, expected, label] of checks) {
+            if (actual !== expected) throw new Error(`Unexpected ${label}`);
+          }
+          if (Object.hasOwn(config, 'routes') || Object.hasOwn(config, 'route')) {
+            throw new Error('Production configuration must not declare routes or custom domains');
+          }
+          if (config.d1_databases?.filter((item) => item.binding === 'DB').length !== 1
+              || config.r2_buckets?.filter((item) => item.binding === 'BUCKET').length !== 1) {
+            throw new Error('Production storage bindings are missing or duplicated');
+          }
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/nivasa-reviewed-config.sha256`,
+            crypto.createHash('sha256').update(source).digest('hex'),
+            { mode: 0o600 },
+          );
+          console.log('Immutable private production target verified.');
+          NODE
+
+      - name: Run local production validation without credentials
+        run: |
+          npm test
+          npx tsc --noEmit
+          npx eslint worker/index.ts worker/production-readiness.mjs vite.config.ts tests/production-readiness.test.mjs
+          npm run build:production
+          npm run cloudflare:deploy:dry-run
+          grep -Eq 'productionReadinessResponse\(request, env, true\)' dist/server/index.js || {
+            echo 'The production readiness gate is not enabled in the built Worker.' >&2
+            exit 1
+          }
+          if grep -Eq 'productionReadinessResponse\(request, env, false\)' dist/server/index.js; then
+            echo 'The production Worker contains a disabled readiness gate.' >&2
+            exit 1
+          fi
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const generated = JSON.parse(fs.readFileSync('dist/server/wrangler.json', 'utf8'));
+          const deploy = JSON.parse(fs.readFileSync('.wrangler/deploy/config.json', 'utf8'));
+          const database = generated.d1_databases?.find((item) => item.binding === 'DB');
+          const bucket = generated.r2_buckets?.find((item) => item.binding === 'BUCKET');
+          const checks = [
+            [generated.name, process.env.EXPECTED_WORKER_NAME],
+            [generated.account_id, process.env.EXPECTED_ACCOUNT_ID],
+            [generated.main, 'index.js'],
+            [generated.workers_dev, false],
+            [generated.preview_urls, false],
+            [generated.assets?.binding, 'ASSETS'],
+            [generated.images?.binding, 'IMAGES'],
+            [database?.database_name, process.env.EXPECTED_DATABASE_NAME],
+            [database?.database_id, process.env.EXPECTED_DATABASE_ID],
+            [bucket?.bucket_name, process.env.EXPECTED_BUCKET_NAME],
+          ];
+          if (checks.some(([actual, expected]) => actual !== expected)) throw new Error('Generated deployment target is unexpected');
+          if (Object.hasOwn(generated, 'routes') || Object.hasOwn(generated, 'route')
+              || Object.keys(generated.triggers ?? {}).length !== 0) throw new Error('Generated deployment contains a public trigger');
+          if (typeof deploy.configPath !== 'string'
+              || !deploy.configPath.replaceAll('\\', '/').endsWith('dist/server/wrangler.json')) {
+            throw new Error('Wrangler deployment redirect is unexpected');
+          }
+          console.log('Generated private Worker configuration verified.');
+          NODE
+          artifact_hash="$(find dist .wrangler/deploy/config.json -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
+          artifact_hash="${artifact_hash%% *}"
+          printf '%s' "${artifact_hash}" > "${RUNNER_TEMP}/nivasa-reviewed-artifact.sha256"
+          chmod 600 "${RUNNER_TEMP}/nivasa-reviewed-artifact.sha256"
+          echo 'Production build, tests, static checks, dry run, and readiness gate passed.'
+
+      - name: Run workflow safety simulations
+        env:
+          REQUESTED_OPERATION: ${{ inputs.operation }}
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs');
+          const workflow = fs.readFileSync('.github/workflows/cloudflare-production-deployment.yml', 'utf8');
+          const reviewedWorkflow = workflow.replace(
+            /      - name: Run workflow safety simulations[\s\S]*?(?=\n      - name:)/,
+            '',
+          );
+          const allowed = (ref, defaultBranch) => ref === 'refs/heads/main' && defaultBranch === 'main';
+          const confirmed = (operation, phrase) => operation !== 'deploy-private'
+            || phrase === 'DEPLOY_NIVASA_PRIVATE_WORKER';
+          const requiredNames = [
+            'NIVASA_SESSION_SECRET', 'MSG91_AUTH_KEY', 'VAPID_PRIVATE_JWK',
+            'NEXT_PUBLIC_MSG91_WIDGET_ID', 'NEXT_PUBLIC_MSG91_WIDGET_TOKEN',
+            'GOOGLE_MAPS_BROWSER_KEY', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
+          ];
+          const targetMatches = (target) => target.account === '0c53a1d6277d240fe99359ce0495fe9d'
+            && target.worker === 'nivasa-home-help'
+            && target.database === '508b580c-9da0-41ad-97d2-4695047eb2b0'
+            && target.bucket === 'nivasa-private-address-proofs';
+          const workerAllowed = (state, requireAllSecrets = false) => {
+            if (!state.exists) return !requireAllSecrets;
+            if (state.workersDev || state.previews || state.routes !== 0 || state.domains !== 0) return false;
+            if (!state.bindings) return false;
+            const names = [...state.secrets].sort();
+            if (new Set(names).size !== names.length || names.some((name) => !requiredNames.includes(name))) return false;
+            return !requireAllSecrets || JSON.stringify(names) === JSON.stringify([...requiredNames].sort());
+          };
+          assert.equal(allowed('refs/heads/main', 'main'), true);
+          assert.equal(allowed('refs/heads/feature', 'main'), false);
+          assert.equal(confirmed('deploy-private', ''), false);
+          assert.equal(confirmed('deploy-private', 'DEPLOY_NIVASA_PRIVATE_WORKER'), true);
+          assert.equal(confirmed('preflight', ''), true);
+          assert.equal(requiredNames.every((name) => ({ ...Object.fromEntries(requiredNames.map((item) => [item, 'present'])) })[name]), true);
+          assert.equal(requiredNames.every((name) => ({ NIVASA_SESSION_SECRET: 'present' })[name]), false);
+          assert.equal(targetMatches({
+            account: '0c53a1d6277d240fe99359ce0495fe9d', worker: 'nivasa-home-help',
+            database: '508b580c-9da0-41ad-97d2-4695047eb2b0', bucket: 'nivasa-private-address-proofs',
+          }), true);
+          assert.equal(targetMatches({ account: 'wrong', worker: 'nivasa-home-help', database: 'wrong', bucket: 'wrong' }), false);
+          assert.equal(workerAllowed({ exists: false }), true);
+          const privateWorker = { exists: true, workersDev: false, previews: false, routes: 0, domains: 0, bindings: true, secrets: [] };
+          assert.equal(workerAllowed(privateWorker), true);
+          assert.equal(workerAllowed({ ...privateWorker, workersDev: true }), false);
+          assert.equal(workerAllowed({ ...privateWorker, previews: true }), false);
+          assert.equal(workerAllowed({ ...privateWorker, routes: 1 }), false);
+          assert.equal(workerAllowed({ ...privateWorker, domains: 1 }), false);
+          assert.equal(workerAllowed({ ...privateWorker, secrets: ['NIVASA_SESSION_SECRET'] }), true);
+          assert.equal(workerAllowed({ ...privateWorker, secrets: requiredNames }, true), true);
+          assert.equal(workerAllowed({ ...privateWorker, secrets: requiredNames.slice(1) }, true), false);
+          assert.equal(workerAllowed({ ...privateWorker, secrets: [...requiredNames, 'UNEXPECTED'] }), false);
+          assert.match(workflow, /environment:\s*production/);
+          assert.match(workflow, /if:\s*\$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
+          assert.doesNotMatch(reviewedWorkflow, /wrangler\s+d1\s+migrations\s+apply/);
+          assert.doesNotMatch(reviewedWorkflow, /wrangler\s+r2\s+object\s+(put|delete)/);
+          assert.match(workflow, /\[config\.workers_dev, false, 'Workers\.dev setting'\]/);
+          assert.match(workflow, /\[config\.preview_urls, false, 'preview URL setting'\]/);
+          assert.doesNotMatch(reviewedWorkflow, /set\s+-x|ACTIONS_STEP_DEBUG|::set-output/);
+          assert.doesNotMatch(reviewedWorkflow, /save-state|GITHUB_STEP_SUMMARY|upload-artifact/);
+          assert.doesNotMatch(reviewedWorkflow, /console\.(log|error)\([^\n]*process\.env/);
+          assert.doesNotMatch(reviewedWorkflow, /echo[^\n]*\$\{(?:CLOUDFLARE|NIVASA|MSG91|VAPID|NEXT_PUBLIC|GOOGLE)/);
+          assert.match(reviewedWorkflow, /- name: Remove temporary deployment material[\s\S]*?if:\s*\$\{\{ always\(\) \}\}[\s\S]*?rm -f --/);
+          assert.match(reviewedWorkflow, /wrangler secret bulk[^\n]*< "\$\{secret_file\}"/);
+          assert.doesNotMatch(reviewedWorkflow, /wrangler secret (put|delete)|--secrets-file/);
+          console.log('Static workflow security boundaries verified.');
+          NODE
+
+      - name: Require explicit private-deployment confirmation
+        if: ${{ inputs.operation == 'deploy-private' }}
+        env:
+          DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          [[ "${DEPLOY_CONFIRMATION}" == 'DEPLOY_NIVASA_PRIVATE_WORKER' ]] || {
+            echo 'The exact private-deployment confirmation phrase is required.' >&2
+            exit 1
+          }
+          echo 'Private-deployment confirmation verified.'
+
+      - name: Validate all runtime values without logging them
+        env:
+          NIVASA_SESSION_SECRET: ${{ secrets.NIVASA_SESSION_SECRET }}
+          MSG91_AUTH_KEY: ${{ secrets.MSG91_AUTH_KEY }}
+          VAPID_PRIVATE_JWK: ${{ secrets.VAPID_PRIVATE_JWK }}
+          NEXT_PUBLIC_MSG91_WIDGET_ID: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_ID }}
+          NEXT_PUBLIC_MSG91_WIDGET_TOKEN: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_TOKEN }}
+          GOOGLE_MAPS_BROWSER_KEY: ${{ vars.GOOGLE_MAPS_BROWSER_KEY }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          VAPID_SUBJECT: ${{ vars.VAPID_SUBJECT }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { productionConfigurationReady } from './worker/production-readiness.mjs';
+          const names = [
+            'NIVASA_SESSION_SECRET', 'MSG91_AUTH_KEY', 'VAPID_PRIVATE_JWK',
+            'NEXT_PUBLIC_MSG91_WIDGET_ID', 'NEXT_PUBLIC_MSG91_WIDGET_TOKEN',
+            'GOOGLE_MAPS_BROWSER_KEY', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
+          ];
+          if (names.some((name) => typeof process.env[name] !== 'string' || process.env[name].length === 0)) {
+            throw new Error('Required production runtime configuration is unavailable');
+          }
+          const environment = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+          Object.assign(environment, {
+            DB: { prepare() {} },
+            BUCKET: { put() {}, delete() {} },
+            ASSETS: { fetch() {} },
+            IMAGES: { input() {} },
+          });
+          if (!await productionConfigurationReady(environment)) {
+            throw new Error('Production runtime configuration failed structural validation');
+          }
+          console.log('All required runtime settings passed non-logging structural validation.');
+          NODE
+
+      - name: Authenticate, preflight, and deploy privately when requested
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          REQUESTED_OPERATION: ${{ inputs.operation }}
+        run: |
+          [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]] || {
+            echo 'Cloudflare authentication is unavailable.' >&2
+            exit 1
+          }
+
+          cat > "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs" <<'NODE'
+          import fs from 'node:fs';
+          const base = 'https://api.cloudflare.com/client/v4';
+          const account = process.env.EXPECTED_ACCOUNT_ID;
+          const worker = process.env.EXPECTED_WORKER_NAME;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const expectedSecrets = [
+            'GOOGLE_MAPS_BROWSER_KEY', 'MSG91_AUTH_KEY', 'NEXT_PUBLIC_MSG91_WIDGET_ID',
+            'NEXT_PUBLIC_MSG91_WIDGET_TOKEN', 'NIVASA_SESSION_SECRET',
+            'VAPID_PRIVATE_JWK', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
+          ];
+          if (!token) throw new Error('Cloudflare authentication is unavailable');
+
+          async function get(path, allowNotFound = false) {
+            const response = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+            if (allowNotFound && response.status === 404) return null;
+            if (!response.ok) throw new Error(`Cloudflare read failed with HTTP ${response.status}`);
+            const body = await response.json();
+            if (body.success !== true || !Array.isArray(body.errors) || body.errors.length !== 0) {
+              throw new Error('Cloudflare returned an ambiguous API envelope');
+            }
+            return body;
+          }
+
+          async function list(path) {
+            const results = [];
+            for (let page = 1; page <= 100; page += 1) {
+              const separator = path.includes('?') ? '&' : '?';
+              const body = await get(`${path}${separator}page=${page}&per_page=50`);
+              if (!Array.isArray(body.result) || body.result.length > 50) throw new Error('Cloudflare list response was malformed');
+              results.push(...body.result);
+              const info = body.result_info;
+              if (info !== undefined) {
+                if (!Number.isInteger(info.page) || !Number.isInteger(info.total_pages)
+                    || info.page !== page || info.total_pages < page) throw new Error('Cloudflare pagination metadata was malformed');
+                if (page === info.total_pages) return results;
+              } else if (body.result.length < 50) return results;
+              else throw new Error('Cloudflare pagination metadata was ambiguous');
+            }
+            throw new Error('Cloudflare pagination exceeded the safety bound');
+          }
+
+          const scripts = await list(`/accounts/${account}/workers/scripts`);
+          if (scripts.some((item) => typeof item?.id !== 'string')) throw new Error('Workers list was malformed');
+          const matches = scripts.filter((item) => item.id === worker);
+          if (matches.length > 1) throw new Error('Worker identity was ambiguous');
+          const workerExists = matches.length === 1;
+
+          const managed = await get(`/accounts/${account}/r2/buckets/${process.env.EXPECTED_BUCKET_NAME}/domains/managed`);
+          const customR2 = await get(`/accounts/${account}/r2/buckets/${process.env.EXPECTED_BUCKET_NAME}/domains/custom`);
+          if (managed.result?.enabled !== false || !Array.isArray(customR2.result?.domains)
+              || customR2.result.domains.length !== 0) throw new Error('R2 bucket is not private');
+
+          const domains = await list(`/accounts/${account}/workers/domains?service=${encodeURIComponent(worker)}`);
+          if (domains.some((domain) => domain?.service === worker)) throw new Error('Worker has a custom domain');
+          const zones = await list(`/zones?account.id=${account}`);
+          for (const zone of zones) {
+            if (typeof zone?.id !== 'string') throw new Error('Zone list was malformed');
+            const routes = await list(`/zones/${zone.id}/workers/routes`);
+            if (routes.some((route) => route?.script === worker)) throw new Error('Worker has a zone route');
+          }
+
+          let secretNames = [];
+          let versionId = null;
+          if (workerExists) {
+            const subdomain = await get(`/accounts/${account}/workers/scripts/${worker}/subdomain`);
+            if (subdomain.result?.enabled !== false || subdomain.result?.previews_enabled !== false) {
+              throw new Error('Worker public or preview URL access is enabled');
+            }
+            const settings = await get(`/accounts/${account}/workers/scripts/${worker}/settings`);
+            const bindings = settings.result?.bindings;
+            if (!Array.isArray(bindings)) throw new Error('Worker binding metadata was malformed');
+            const requireBinding = (name, type, property, value) => {
+              const found = bindings.filter((binding) => binding?.name === name && binding?.type === type);
+              if (found.length !== 1 || (property && found[0][property] !== value)) throw new Error(`Unexpected ${name} binding metadata`);
+            };
+            requireBinding('DB', 'd1', 'database_id', process.env.EXPECTED_DATABASE_ID);
+            requireBinding('BUCKET', 'r2_bucket', 'bucket_name', process.env.EXPECTED_BUCKET_NAME);
+            requireBinding('ASSETS', 'assets');
+            requireBinding('IMAGES', 'images');
+            secretNames = bindings.filter((binding) => binding?.type === 'secret_text').map((binding) => binding.name).sort();
+            if (secretNames.some((name) => !expectedSecrets.includes(name)) || new Set(secretNames).size !== secretNames.length) {
+              throw new Error('Worker secret-name metadata is unexpected');
+            }
+            const versions = await list(`/accounts/${account}/workers/scripts/${worker}/versions`);
+            if (versions.length > 0) {
+              if (typeof versions[0]?.id !== 'string' || versions[0].id.length === 0) throw new Error('Worker version metadata was malformed');
+              versionId = versions[0].id;
+            }
+          }
+          if (process.env.REQUIRE_WORKER === '1' && !workerExists) throw new Error('Expected Worker does not exist');
+          if (process.env.REQUIRE_ALL_SECRETS === '1'
+              && JSON.stringify(secretNames) !== JSON.stringify(expectedSecrets)) throw new Error('Expected Worker secret names are incomplete');
+          const state = { workerExists, secretNames, versionId, privateAccess: true, r2Private: true };
+          fs.writeFileSync(process.env.STATE_PATH, JSON.stringify(state), { mode: 0o600 });
+          console.log(workerExists ? 'Existing exact private Worker state verified.' : 'No conflicting Worker exists.');
+          NODE
+          chmod 600 "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
+
+          cat > "${RUNNER_TEMP}/nivasa-validate-d1.cjs" <<'NODE'
+          const fs = require('node:fs');
+          const temp = process.env.RUNNER_TEMP;
+          const infoDocument = JSON.parse(fs.readFileSync(`${temp}/nivasa-d1-info.json`, 'utf8'));
+          const info = infoDocument.result ?? infoDocument;
+          if ((info.uuid ?? info.database_id) !== process.env.EXPECTED_DATABASE_ID
+              || info.name !== process.env.EXPECTED_DATABASE_NAME) throw new Error('Remote D1 identity is unexpected');
+          const blocks = JSON.parse(fs.readFileSync(`${temp}/nivasa-d1-ledger.json`, 'utf8'));
+          if (!Array.isArray(blocks) || blocks.length === 0
+              || blocks.some((block) => block.success !== true || !Array.isArray(block.results))) {
+            throw new Error('Remote D1 ledger response was ambiguous');
+          }
+          const actual = blocks.flatMap((block) => block.results).map((row) => row.name);
+          const expected = [
+            '0000_wet_obadiah_stane.sql', '0001_spooky_freak.sql', '0002_tired_manta.sql',
+            '0003_lyrical_iron_monger.sql', '0004_puzzling_tag.sql', '0005_optimal_newton_destine.sql',
+            '0006_oval_ultimates.sql', '0007_strange_calypso.sql', '0008_wealthy_lady_deathstrike.sql',
+            '0009_unusual_black_cat.sql', '0010_lonely_boom_boom.sql',
+          ];
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Remote D1 migration ledger is unexpected');
+          const pending = fs.readFileSync(`${temp}/nivasa-pending-migrations.txt`, 'utf8');
+          if (/\b\d{4}_[A-Za-z0-9_]+\.sql\b/.test(pending)) throw new Error('Remote D1 migrations remain pending');
+          console.log('Remote D1 identity and completed 11-entry ledger verified; zero migrations pending.');
+          NODE
+          chmod 600 "${RUNNER_TEMP}/nivasa-validate-d1.cjs"
+
+          run_d1_checks() {
+            ./node_modules/.bin/wrangler d1 info DB --config wrangler.jsonc --json > "${RUNNER_TEMP}/nivasa-d1-info.json"
+            ./node_modules/.bin/wrangler d1 migrations list DB --config wrangler.jsonc --remote > "${RUNNER_TEMP}/nivasa-pending-migrations.txt"
+            ./node_modules/.bin/wrangler d1 execute DB --config wrangler.jsonc --remote --json \
+              --command 'SELECT name FROM d1_migrations ORDER BY id' > "${RUNNER_TEMP}/nivasa-d1-ledger.json"
+            node "${RUNNER_TEMP}/nivasa-validate-d1.cjs"
+          }
+
+          STATE_PATH="${RUNNER_TEMP}/nivasa-preflight-state.json" REQUIRE_WORKER=0 REQUIRE_ALL_SECRETS=0 \
+            node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
+          run_d1_checks
+
+          if [[ "${REQUESTED_OPERATION}" == 'preflight' ]]; then
+            echo 'Read-only private deployment preflight completed.'
+            exit 0
+          fi
+
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" && -z "$(git status --porcelain)" ]] || {
+            echo 'Repository state changed after preflight.' >&2
+            exit 1
+          }
+          reviewed_hash="$(cat "${RUNNER_TEMP}/nivasa-reviewed-config.sha256")"
+          current_hash="$(sha256sum wrangler.jsonc)"
+          current_hash="${current_hash%% *}"
+          [[ "${current_hash}" == "${reviewed_hash}" ]] || {
+            echo 'Production configuration changed after review.' >&2
+            exit 1
+          }
+          grep -Eq 'productionReadinessResponse\(request, env, true\)' dist/server/index.js || {
+            echo 'The reviewed production artifact is unavailable.' >&2
+            exit 1
+          }
+          reviewed_artifact_hash="$(cat "${RUNNER_TEMP}/nivasa-reviewed-artifact.sha256")"
+          artifact_hash="$(find dist .wrangler/deploy/config.json -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum)"
+          artifact_hash="${artifact_hash%% *}"
+          [[ "${artifact_hash}" == "${reviewed_artifact_hash}" ]] || {
+            echo 'The production artifact changed after validation.' >&2
+            exit 1
+          }
+          STATE_PATH="${RUNNER_TEMP}/nivasa-fresh-state.json" REQUIRE_WORKER=0 REQUIRE_ALL_SECRETS=0 \
+            node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
+          cmp --silent "${RUNNER_TEMP}/nivasa-preflight-state.json" "${RUNNER_TEMP}/nivasa-fresh-state.json" || {
+            echo 'Remote Worker state changed after preflight.' >&2
+            exit 1
+          }
+          run_d1_checks
+          ./node_modules/.bin/wrangler deploy --strict
+          STATE_PATH="${RUNNER_TEMP}/nivasa-post-deploy-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=0 \
+            node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
+          echo 'Exact Worker artifact deployed with public and preview access disabled.'
+
+      - name: Install runtime values as Worker secrets
+        if: ${{ inputs.operation == 'deploy-private' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NIVASA_SESSION_SECRET: ${{ secrets.NIVASA_SESSION_SECRET }}
+          MSG91_AUTH_KEY: ${{ secrets.MSG91_AUTH_KEY }}
+          VAPID_PRIVATE_JWK: ${{ secrets.VAPID_PRIVATE_JWK }}
+          NEXT_PUBLIC_MSG91_WIDGET_ID: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_ID }}
+          NEXT_PUBLIC_MSG91_WIDGET_TOKEN: ${{ vars.NEXT_PUBLIC_MSG91_WIDGET_TOKEN }}
+          GOOGLE_MAPS_BROWSER_KEY: ${{ vars.GOOGLE_MAPS_BROWSER_KEY }}
+          VAPID_PUBLIC_KEY: ${{ vars.VAPID_PUBLIC_KEY }}
+          VAPID_SUBJECT: ${{ vars.VAPID_SUBJECT }}
+        run: |
+          secret_file="${RUNNER_TEMP}/nivasa-worker-secrets.json"
+          trap 'rm -f -- "${secret_file}"' EXIT
+          umask 077
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { productionConfigurationReady } from './worker/production-readiness.mjs';
+          const names = [
+            'GOOGLE_MAPS_BROWSER_KEY', 'MSG91_AUTH_KEY', 'NEXT_PUBLIC_MSG91_WIDGET_ID',
+            'NEXT_PUBLIC_MSG91_WIDGET_TOKEN', 'NIVASA_SESSION_SECRET',
+            'VAPID_PRIVATE_JWK', 'VAPID_PUBLIC_KEY', 'VAPID_SUBJECT',
+          ];
+          if (names.some((name) => typeof process.env[name] !== 'string' || process.env[name].length === 0)) {
+            throw new Error('Required runtime configuration is unavailable');
+          }
+          const environment = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+          Object.assign(environment, {
+            DB: { prepare() {} },
+            BUCKET: { put() {}, delete() {} },
+            ASSETS: { fetch() {} },
+            IMAGES: { input() {} },
+          });
+          if (!await productionConfigurationReady(environment)) {
+            throw new Error('Production runtime configuration failed fresh structural validation');
+          }
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/nivasa-worker-secrets.json`,
+            JSON.stringify(Object.fromEntries(names.map((name) => [name, process.env[name]]))),
+            { mode: 0o600 },
+          );
+          NODE
+          [[ "$(stat -c '%a' "${secret_file}")" == '600' ]] || {
+            echo 'Temporary secret file permissions are unsafe.' >&2
+            exit 1
+          }
+          ./node_modules/.bin/wrangler secret bulk --name "${EXPECTED_WORKER_NAME}" --config wrangler.jsonc < "${secret_file}"
+          rm -f -- "${secret_file}"
+          trap - EXIT
+          echo 'Eight runtime setting names were installed as encrypted Worker secrets.'
+
+      - name: Verify final private deployment
+        if: ${{ inputs.operation == 'deploy-private' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          STATE_PATH="${RUNNER_TEMP}/nivasa-final-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 \
+            node "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
+          ./node_modules/.bin/wrangler d1 migrations list DB --config wrangler.jsonc --remote \
+            > "${RUNNER_TEMP}/nivasa-final-pending.txt"
+          ./node_modules/.bin/wrangler d1 execute DB --config wrangler.jsonc --remote --json \
+            --command 'SELECT name FROM d1_migrations ORDER BY id' > "${RUNNER_TEMP}/nivasa-final-ledger.json"
+          if grep -Eq '\b[0-9]{4}_[A-Za-z0-9_]+\.sql\b' "${RUNNER_TEMP}/nivasa-final-pending.txt"; then
+            echo 'Remote D1 migrations are unexpectedly pending.' >&2
+            exit 1
+          fi
+          node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const blocks = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/nivasa-final-ledger.json`, 'utf8'));
+          if (!Array.isArray(blocks) || blocks.length === 0
+              || blocks.some((block) => block.success !== true || !Array.isArray(block.results))) {
+            throw new Error('Final D1 ledger response was ambiguous');
+          }
+          const actual = blocks.flatMap((block) => block.results).map((row) => row.name);
+          const expected = [
+            '0000_wet_obadiah_stane.sql', '0001_spooky_freak.sql', '0002_tired_manta.sql',
+            '0003_lyrical_iron_monger.sql', '0004_puzzling_tag.sql', '0005_optimal_newton_destine.sql',
+            '0006_oval_ultimates.sql', '0007_strange_calypso.sql', '0008_wealthy_lady_deathstrike.sql',
+            '0009_unusual_black_cat.sql', '0010_lonely_boom_boom.sql',
+          ];
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Final D1 migration ledger is unexpected');
+          NODE
+          version_id="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(!s.versionId)process.exit(1); process.stdout.write(s.versionId)")"
+          echo "Verified private Worker version: ${version_id}"
+          echo 'Final Worker bindings, secret names, D1 ledger, R2 privacy, and absence of public URLs verified.'
+
+      - name: Remove temporary deployment material
+        if: ${{ always() }}
+        run: |
+          rm -f -- \
+            "${RUNNER_TEMP}/nivasa-worker-secrets.json" \
+            "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs" \
+            "${RUNNER_TEMP}/nivasa-validate-d1.cjs" \
+            "${RUNNER_TEMP}/nivasa-reviewed-config.sha256" \
+            "${RUNNER_TEMP}/nivasa-reviewed-artifact.sha256" \
+            "${RUNNER_TEMP}/nivasa-preflight-state.json" \
+            "${RUNNER_TEMP}/nivasa-fresh-state.json" \
+            "${RUNNER_TEMP}/nivasa-post-deploy-state.json" \
+            "${RUNNER_TEMP}/nivasa-final-state.json" \
+            "${RUNNER_TEMP}/nivasa-d1-info.json" \
+            "${RUNNER_TEMP}/nivasa-d1-ledger.json" \
+            "${RUNNER_TEMP}/nivasa-final-ledger.json" \
+            "${RUNNER_TEMP}/nivasa-pending-migrations.txt" \
+            "${RUNNER_TEMP}/nivasa-final-pending.txt"
+          echo 'Temporary deployment material removed.'
