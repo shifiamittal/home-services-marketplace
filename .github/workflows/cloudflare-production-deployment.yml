@@ -301,16 +301,11 @@ jobs:
             const matches = body.result.filter((item) => item.id === target);
             if (matches.length > 1) throw new Error('Duplicate Worker');
             if (matches.length === 0) return null;
-            if (!Array.isArray(matches[0].routes)) throw new Error('Malformed Worker routes');
-            for (const route of matches[0].routes) {
-              if (!route || typeof route !== 'object' || Array.isArray(route)
-                  || typeof route.id !== 'string' || route.id.length === 0
-                  || typeof route.pattern !== 'string' || route.pattern.length === 0
-                  || (route.script !== undefined && (typeof route.script !== 'string' || route.script.length === 0))) {
-                throw new Error('Malformed Worker route');
-              }
+            const routes = matches[0].routes;
+            if (routes !== undefined && routes !== null && !Array.isArray(routes)) {
+              throw new Error('Malformed Worker routes');
             }
-            if (matches[0].routes.length !== 0) throw new Error('Worker route exists');
+            if (Array.isArray(routes) && routes.length !== 0) throw new Error('Worker route exists');
             return matches[0];
           };
           const domains = (body, target, status = 200, write = () => {}) => {
@@ -358,7 +353,7 @@ jobs:
           };
           const workerAllowed = (state, requireAllSecrets = false) => {
             if (!state.exists) return !requireAllSecrets;
-            if (state.workersDev || state.previews || state.routes !== 0 || state.domains !== 0) return false;
+            if (state.workersDev || state.previews || state.domains !== 0) return false;
             if (!state.bindings) return false;
             const names = [...state.secrets].sort();
             if (new Set(names).size !== names.length || names.some((name) => !requiredNames.includes(name))) return false;
@@ -379,10 +374,13 @@ jobs:
           const ok = (result) => ({ success: true, errors: [], result });
           assert.equal(workers(ok([]), 'nivasa-home-help'), null);
           assert.equal(workers(ok([{ id: 'nivasa-home-help', routes: [] }]), 'nivasa-home-help').id, 'nivasa-home-help');
-          assert.throws(() => workers(ok([{ id: 'nivasa-home-help' }]), 'nivasa-home-help'));
+          assert.equal(workers(ok([{ id: 'nivasa-home-help' }]), 'nivasa-home-help').id, 'nivasa-home-help');
+          assert.equal(workers(ok([{ id: 'nivasa-home-help', routes: null }]), 'nivasa-home-help').id, 'nivasa-home-help');
           assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: {} }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: 'none' }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: 0 }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: false }]), 'nivasa-home-help'));
           assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [{ id: 'route', pattern: 'example.com/*', script: 'nivasa-home-help' }] }]), 'nivasa-home-help'));
-          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [{ id: '', pattern: 'example.com/*' }] }]), 'nivasa-home-help'));
           assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [] }, { id: 'nivasa-home-help', routes: [] }]), 'nivasa-home-help'));
           assert.throws(() => workers(ok([null]), 'nivasa-home-help'));
           assert.deepEqual(domains(ok([]), 'nivasa-home-help'), []);
@@ -486,21 +484,24 @@ jobs:
           assert.throws(() => versions(ok({ items: [{}] })));
           assert.throws(() => versions(ok({ items: [{ id: '' }] })));
           assert.throws(() => versions(ok({ items: [{ id: 'same' }, { id: 'same' }] })));
-          assert.equal(workerAllowed({ exists: false }), true);
-          const privateWorker = { exists: true, workersDev: false, previews: false, routes: 0, domains: 0, bindings: true, secrets: [] };
-          assert.equal(workerAllowed(privateWorker), true);
-          assert.equal(workerAllowed({ ...privateWorker, workersDev: true }), false);
-          assert.equal(workerAllowed({ ...privateWorker, previews: true }), false);
-          assert.equal(workerAllowed({ ...privateWorker, routes: 1 }), false);
-          assert.equal(workerAllowed({ ...privateWorker, domains: 1 }), false);
-          assert.equal(workerAllowed({ ...privateWorker, secrets: ['NIVASA_SESSION_SECRET'] }), true);
-          assert.equal(workerAllowed({ ...privateWorker, secrets: requiredNames }, true), true);
-          assert.equal(workerAllowed({ ...privateWorker, secrets: requiredNames.slice(1) }, true), false);
-          assert.equal(workerAllowed({ ...privateWorker, secrets: [...requiredNames, 'UNEXPECTED'] }), false);
+          const firstDeployment = { exists: false };
+          assert.equal(workerAllowed(firstDeployment), true);
+          const partialRecoveryWorker = {
+            exists: true, workersDev: false, previews: false, domains: 0, bindings: true, secrets: [],
+          };
+          assert.equal(workerAllowed(partialRecoveryWorker), true);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, workersDev: true }), false);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, previews: true }), false);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, domains: 1 }), false);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: ['NIVASA_SESSION_SECRET'] }), true);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: requiredNames }, true), true);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: requiredNames.slice(1) }, true), false);
+          assert.equal(workerAllowed({ ...partialRecoveryWorker, secrets: [...requiredNames, 'UNEXPECTED'] }), false);
           assert.match(workflow, /environment:\s*production/);
           assert.match(workflow, /if:\s*\$\{\{ github\.ref == 'refs\/heads\/main' \}\}/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler\s+d1\s+migrations\s+apply/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler\s+r2\s+object\s+(put|delete)/);
+          assert.doesNotMatch(reviewedWorkflow, /wrangler\s+(?:routes?|domains?)\s/);
           assert.match(workflow, /\[config\.workers_dev, false, 'Workers\.dev setting'\]/);
           assert.match(workflow, /\[config\.preview_urls, false, 'preview URL setting'\]/);
           assert.doesNotMatch(reviewedWorkflow, /set\s+-x|ACTIONS_STEP_DEBUG|::set-output/);
@@ -662,16 +663,12 @@ jobs:
             if (matches.length > 1) throw new Error('Worker identity was ambiguous');
             if (matches.length === 0) return null;
             const matched = matches[0];
-            if (!Array.isArray(matched.routes)) throw new Error('Worker route metadata was missing or malformed');
-            for (const route of matched.routes) {
-              if (!route || typeof route !== 'object' || Array.isArray(route)
-                  || typeof route.id !== 'string' || route.id.length === 0
-                  || typeof route.pattern !== 'string' || route.pattern.length === 0
-                  || (route.script !== undefined && (typeof route.script !== 'string' || route.script.length === 0))) {
-                throw new Error('Worker route metadata was malformed');
-              }
+            if (matched.routes !== undefined && matched.routes !== null && !Array.isArray(matched.routes)) {
+              throw new Error('Worker route metadata was malformed');
             }
-            if (matched.routes.length !== 0) throw new Error('Worker has an account-reported route');
+            if (Array.isArray(matched.routes) && matched.routes.length !== 0) {
+              throw new Error('Worker has an account-reported route');
+            }
             return matched;
           }
 
