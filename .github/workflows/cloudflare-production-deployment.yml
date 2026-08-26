@@ -223,6 +223,80 @@ jobs:
             && target.worker === 'nivasa-home-help'
             && target.database === '508b580c-9da0-41ad-97d2-4695047eb2b0'
             && target.bucket === 'nivasa-private-address-proofs';
+          const envelope = (body) => {
+            if (!body || typeof body !== 'object' || Array.isArray(body)
+                || body.success !== true || !Array.isArray(body.errors) || body.errors.length !== 0) {
+              throw new Error('Ambiguous API envelope');
+            }
+            return body;
+          };
+          const workers = (body, target) => {
+            envelope(body);
+            if (!Array.isArray(body.result)) throw new Error('Malformed Workers result');
+            for (const item of body.result) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)
+                  || (item.id !== undefined && (typeof item.id !== 'string' || item.id.length === 0))) {
+                throw new Error('Malformed Worker item');
+              }
+            }
+            const matches = body.result.filter((item) => item.id === target);
+            if (matches.length > 1) throw new Error('Duplicate Worker');
+            if (matches.length === 0) return null;
+            if (!Array.isArray(matches[0].routes)) throw new Error('Malformed Worker routes');
+            for (const route of matches[0].routes) {
+              if (!route || typeof route !== 'object' || Array.isArray(route)
+                  || typeof route.id !== 'string' || route.id.length === 0
+                  || typeof route.pattern !== 'string' || route.pattern.length === 0
+                  || (route.script !== undefined && (typeof route.script !== 'string' || route.script.length === 0))) {
+                throw new Error('Malformed Worker route');
+              }
+            }
+            if (matches[0].routes.length !== 0) throw new Error('Worker route exists');
+            return matches[0];
+          };
+          const domains = (body, target) => {
+            envelope(body);
+            if (!Array.isArray(body.result)) throw new Error('Malformed domains result');
+            const info = body.result_info;
+            if (info !== undefined) {
+              if (!info || typeof info !== 'object' || Array.isArray(info)) throw new Error('Malformed domains result_info');
+              for (const field of ['page', 'per_page', 'count', 'total_count', 'total_pages']) {
+                if (info[field] !== undefined && (!Number.isInteger(info[field]) || info[field] < 0)) {
+                  throw new Error('Malformed domains pagination metadata');
+                }
+              }
+            }
+            for (const domain of body.result) {
+              if (!domain || typeof domain !== 'object' || Array.isArray(domain)
+                  || domain.service !== target) {
+                throw new Error('Malformed domain item');
+              }
+            }
+            if (body.result.length !== 0) throw new Error('Worker domain exists');
+            if ((info?.count ?? 0) > 0) {
+              throw new Error('Contradictory domains result count');
+            }
+            return body.result;
+          };
+          const versions = (body) => {
+            envelope(body);
+            if (!body.result || typeof body.result !== 'object' || Array.isArray(body.result)
+                || !Array.isArray(body.result.items)) throw new Error('Malformed versions result');
+            const ids = [];
+            for (const item of body.result.items) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Malformed version item');
+              if (item.id !== undefined) {
+                if (typeof item.id !== 'string' || item.id.length === 0) throw new Error('Malformed version ID');
+                ids.push(item.id);
+              }
+            }
+            if (new Set(ids).size !== ids.length) throw new Error('Duplicate version ID');
+            if (body.result.items.length > 0
+                && (typeof body.result.items[0].id !== 'string' || body.result.items[0].id.length === 0)) {
+              throw new Error('Latest version ID is unavailable');
+            }
+            return body.result.items[0]?.id ?? null;
+          };
           const workerAllowed = (state, requireAllSecrets = false) => {
             if (!state.exists) return !requireAllSecrets;
             if (state.workersDev || state.previews || state.routes !== 0 || state.domains !== 0) return false;
@@ -243,6 +317,42 @@ jobs:
             database: '508b580c-9da0-41ad-97d2-4695047eb2b0', bucket: 'nivasa-private-address-proofs',
           }), true);
           assert.equal(targetMatches({ account: 'wrong', worker: 'nivasa-home-help', database: 'wrong', bucket: 'wrong' }), false);
+          const ok = (result) => ({ success: true, errors: [], result });
+          assert.equal(workers(ok([]), 'nivasa-home-help'), null);
+          assert.equal(workers(ok([{ id: 'nivasa-home-help', routes: [] }]), 'nivasa-home-help').id, 'nivasa-home-help');
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help' }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: {} }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [{ id: 'route', pattern: 'example.com/*', script: 'nivasa-home-help' }] }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [{ id: '', pattern: 'example.com/*' }] }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([{ id: 'nivasa-home-help', routes: [] }, { id: 'nivasa-home-help', routes: [] }]), 'nivasa-home-help'));
+          assert.throws(() => workers(ok([null]), 'nivasa-home-help'));
+          assert.deepEqual(domains(ok([]), 'nivasa-home-help'), []);
+          assert.deepEqual(domains({
+            success: true, errors: [], result: [],
+            result_info: { page: 1, per_page: 50, count: 0, total_count: 0, total_pages: 0 },
+          }, 'nivasa-home-help'), []);
+          assert.throws(() => domains(ok([{ service: 'nivasa-home-help' }]), 'nivasa-home-help'));
+          assert.throws(() => domains(ok([{ service: 'unrelated-worker' }]), 'nivasa-home-help'));
+          assert.throws(() => domains(ok({}), 'nivasa-home-help'));
+          assert.throws(() => domains(ok([{}]), 'nivasa-home-help'));
+          assert.throws(() => domains({ success: true, errors: [], result: [], result_info: [] }, 'nivasa-home-help'));
+          assert.throws(() => domains({ success: true, errors: [], result: [], result_info: { count: -1 } }, 'nivasa-home-help'));
+          assert.throws(() => domains({ success: true, errors: [], result: [], result_info: { count: 1 } }, 'nivasa-home-help'));
+          assert.deepEqual(domains({
+            success: true, errors: [], result: [], result_info: { count: 0, total_count: 1 },
+          }, 'nivasa-home-help'), []);
+          assert.throws(() => domains({ success: false, errors: [], result: [] }, 'nivasa-home-help'));
+          assert.throws(() => domains({ success: true, errors: [] }, 'nivasa-home-help'));
+          assert.equal(versions(ok({ items: [{ id: 'latest' }, { id: 'older' }] })), 'latest');
+          assert.equal(versions(ok({ items: [] })), null);
+          assert.throws(() => versions({ success: true, errors: [] }));
+          assert.throws(() => versions(ok([])));
+          assert.throws(() => versions(ok({})));
+          assert.throws(() => versions(ok({ items: {} })));
+          assert.throws(() => versions(ok({ items: [null] })));
+          assert.throws(() => versions(ok({ items: [{}] })));
+          assert.throws(() => versions(ok({ items: [{ id: '' }] })));
+          assert.throws(() => versions(ok({ items: [{ id: 'same' }, { id: 'same' }] })));
           assert.equal(workerAllowed({ exists: false }), true);
           const privateWorker = { exists: true, workersDev: false, previews: false, routes: 0, domains: 0, bindings: true, secrets: [] };
           assert.equal(workerAllowed(privateWorker), true);
@@ -267,6 +377,11 @@ jobs:
           assert.match(reviewedWorkflow, /- name: Remove temporary deployment material[\s\S]*?if:\s*\$\{\{ always\(\) \}\}[\s\S]*?rm -f --/);
           assert.match(reviewedWorkflow, /wrangler secret bulk[^\n]*< "\$\{secret_file\}"/);
           assert.doesNotMatch(reviewedWorkflow, /wrangler secret (put|delete)|--secrets-file/);
+          assert.equal(
+            reviewedWorkflow.includes("get(`/accounts/${account}/workers/domains?service=${encodeURIComponent(worker)}`)"),
+            true,
+          );
+          assert.equal(reviewedWorkflow.includes("get(`/accounts/${account}/workers/domains`)"), false);
           console.log('Static workflow security boundaries verified.');
           NODE
 
@@ -349,43 +464,86 @@ jobs:
             return body;
           }
 
-          async function list(path) {
-            const results = [];
-            for (let page = 1; page <= 100; page += 1) {
-              const separator = path.includes('?') ? '&' : '?';
-              const body = await get(`${path}${separator}page=${page}&per_page=50`);
-              if (!Array.isArray(body.result) || body.result.length > 50) throw new Error('Cloudflare list response was malformed');
-              results.push(...body.result);
-              const info = body.result_info;
-              if (info !== undefined) {
-                if (!Number.isInteger(info.page) || !Number.isInteger(info.total_pages)
-                    || info.page !== page || info.total_pages < page) throw new Error('Cloudflare pagination metadata was malformed');
-                if (page === info.total_pages) return results;
-              } else if (body.result.length < 50) return results;
-              else throw new Error('Cloudflare pagination metadata was ambiguous');
+          function parseWorkers(body) {
+            if (!Array.isArray(body.result)) throw new Error('Workers list response was malformed');
+            for (const item of body.result) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)
+                  || (item.id !== undefined && (typeof item.id !== 'string' || item.id.length === 0))) {
+                throw new Error('Worker metadata was malformed');
+              }
             }
-            throw new Error('Cloudflare pagination exceeded the safety bound');
+            const matches = body.result.filter((item) => item.id === worker);
+            if (matches.length > 1) throw new Error('Worker identity was ambiguous');
+            if (matches.length === 0) return null;
+            const matched = matches[0];
+            if (!Array.isArray(matched.routes)) throw new Error('Worker route metadata was missing or malformed');
+            for (const route of matched.routes) {
+              if (!route || typeof route !== 'object' || Array.isArray(route)
+                  || typeof route.id !== 'string' || route.id.length === 0
+                  || typeof route.pattern !== 'string' || route.pattern.length === 0
+                  || (route.script !== undefined && (typeof route.script !== 'string' || route.script.length === 0))) {
+                throw new Error('Worker route metadata was malformed');
+              }
+            }
+            if (matched.routes.length !== 0) throw new Error('Worker has an account-reported route');
+            return matched;
           }
 
-          const scripts = await list(`/accounts/${account}/workers/scripts`);
-          if (scripts.some((item) => typeof item?.id !== 'string')) throw new Error('Workers list was malformed');
-          const matches = scripts.filter((item) => item.id === worker);
-          if (matches.length > 1) throw new Error('Worker identity was ambiguous');
-          const workerExists = matches.length === 1;
+          function parseWorkerDomains(body) {
+            if (!Array.isArray(body.result)) throw new Error('Worker custom-domain response was malformed');
+            const info = body.result_info;
+            if (info !== undefined) {
+              if (!info || typeof info !== 'object' || Array.isArray(info)) {
+                throw new Error('Worker custom-domain pagination metadata was malformed');
+              }
+              for (const field of ['page', 'per_page', 'count', 'total_count', 'total_pages']) {
+                if (info[field] !== undefined && (!Number.isInteger(info[field]) || info[field] < 0)) {
+                  throw new Error('Worker custom-domain pagination metadata was malformed');
+                }
+              }
+            }
+            for (const domain of body.result) {
+              if (!domain || typeof domain !== 'object' || Array.isArray(domain)
+                  || domain.service !== worker) {
+                throw new Error('Worker custom-domain metadata was malformed');
+              }
+            }
+            if (body.result.length !== 0) throw new Error('Worker has a custom domain');
+            if ((info?.count ?? 0) > 0) {
+              throw new Error('Worker custom-domain count contradicted the empty filtered result');
+            }
+          }
+
+          function parseVersions(body) {
+            if (!body.result || typeof body.result !== 'object' || Array.isArray(body.result)
+                || !Array.isArray(body.result.items)) throw new Error('Worker version response was malformed');
+            const ids = [];
+            for (const item of body.result.items) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Worker version metadata was malformed');
+              if (item.id !== undefined) {
+                if (typeof item.id !== 'string' || item.id.length === 0) throw new Error('Worker version ID was malformed');
+                ids.push(item.id);
+              }
+            }
+            if (new Set(ids).size !== ids.length) throw new Error('Worker version IDs were duplicated');
+            if (body.result.items.length > 0
+                && (typeof body.result.items[0].id !== 'string' || body.result.items[0].id.length === 0)) {
+              throw new Error('Latest Worker version ID was unavailable');
+            }
+            return body.result.items[0]?.id ?? null;
+          }
+
+          const scripts = await get(`/accounts/${account}/workers/scripts`);
+          const matchedWorker = parseWorkers(scripts);
+          const workerExists = matchedWorker !== null;
 
           const managed = await get(`/accounts/${account}/r2/buckets/${process.env.EXPECTED_BUCKET_NAME}/domains/managed`);
           const customR2 = await get(`/accounts/${account}/r2/buckets/${process.env.EXPECTED_BUCKET_NAME}/domains/custom`);
           if (managed.result?.enabled !== false || !Array.isArray(customR2.result?.domains)
               || customR2.result.domains.length !== 0) throw new Error('R2 bucket is not private');
 
-          const domains = await list(`/accounts/${account}/workers/domains?service=${encodeURIComponent(worker)}`);
-          if (domains.some((domain) => domain?.service === worker)) throw new Error('Worker has a custom domain');
-          const zones = await list(`/zones?account.id=${account}`);
-          for (const zone of zones) {
-            if (typeof zone?.id !== 'string') throw new Error('Zone list was malformed');
-            const routes = await list(`/zones/${zone.id}/workers/routes`);
-            if (routes.some((route) => route?.script === worker)) throw new Error('Worker has a zone route');
-          }
+          const domains = await get(`/accounts/${account}/workers/domains?service=${encodeURIComponent(worker)}`);
+          parseWorkerDomains(domains);
 
           let secretNames = [];
           let versionId = null;
@@ -409,11 +567,8 @@ jobs:
             if (secretNames.some((name) => !expectedSecrets.includes(name)) || new Set(secretNames).size !== secretNames.length) {
               throw new Error('Worker secret-name metadata is unexpected');
             }
-            const versions = await list(`/accounts/${account}/workers/scripts/${worker}/versions`);
-            if (versions.length > 0) {
-              if (typeof versions[0]?.id !== 'string' || versions[0].id.length === 0) throw new Error('Worker version metadata was malformed');
-              versionId = versions[0].id;
-            }
+            const versions = await get(`/accounts/${account}/workers/scripts/${worker}/versions`);
+            versionId = parseVersions(versions);
           }
           if (process.env.REQUIRE_WORKER === '1' && !workerExists) throw new Error('Expected Worker does not exist');
           if (process.env.REQUIRE_ALL_SECRETS === '1'

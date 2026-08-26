@@ -58,6 +58,13 @@ Worker or the exact existing private Worker so it remains safe after a partial
 initial rollout. It does not require application tables to be empty and is safe
 after pilot data exists.
 
+Route absence is verified from the exact matched Worker in Cloudflare's
+account-level List Workers response. The workflow does not infer account-wide
+route absence by enumerating only the zones visible to the token. The token
+needs the Workers Scripts read/write access required for deployment and this
+account-level inspection; it does not need zone enumeration solely for this
+safeguard.
+
 ## Deploy the private Worker
 
 1. Complete and review a successful `preflight` from `main`.
@@ -80,7 +87,11 @@ an `always()` cleanup step.
 The operation is safely repeatable when an earlier run created the private
 Worker but stopped before installing or verifying every secret. It rejects an
 existing Worker with unexpected bindings, secret names, Workers.dev access,
-preview URLs, zone routes, or custom domains.
+preview URLs, account-reported routes, or custom domains. Custom-domain absence
+is checked through Cloudflare's account-level endpoint filtered to the exact
+Worker. Worker Versions are read from the endpoint's documented `result.items`
+envelope, so an existing private Worker remains inspectable during
+partial-deployment recovery.
 
 ## Readiness and public access
 
