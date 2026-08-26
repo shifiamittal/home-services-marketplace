@@ -186,18 +186,25 @@ jobs:
             exit 1
           }
 
-          sha256sum --check --strict <<'CHECKSUMS'
-          145a416e1c68fbe9691ffcd6f1c7066c826deaac169cf9bfbc90cb41f7232c39  drizzle/0000_wet_obadiah_stane.sql
-          cd7b07701f812fa93defabdea928280f341e3022262d23fbf10402d55e8fcda6  drizzle/0001_spooky_freak.sql
-          1b64e1485f6b7d31905c92beaa57a24e5a8385168382525246983ad15832175f  drizzle/0002_tired_manta.sql
-          b4b8d94b5261cf80c73c0d390e223b6c0f12efed6bd4853e71ddbd7d92940386  drizzle/0003_lyrical_iron_monger.sql
-          ee7d87deb73e53e376c0e256b13ca9fc94113ac05fd221a4cc7e3d5f74686bc4  drizzle/0004_puzzling_tag.sql
-          b5168c55630f8937e34d65930e0f921047e0b81203e6b8c8b487debc0b3d4b14  drizzle/0005_optimal_newton_destine.sql
-          315e483447b48cb4b8df20cfbc8b230e214865df145277f22289d38dd62792d4  drizzle/0006_oval_ultimates.sql
-          9fa9e24e96f9b805d244dac18da75e2991ebc0d7d8768027d7d6c65d07fcf447  drizzle/0007_strange_calypso.sql
-          bb9ac30b17fb33dd93c8e6f1cfbc310b63e6b52da8d0114c6ced55832f758ca6  drizzle/0008_wealthy_lady_deathstrike.sql
+          while read -r expected_hash migration_path; do
+            actual_hash="$(git show "HEAD:${migration_path}" | sha256sum)"
+            actual_hash="${actual_hash%% *}"
+            [[ "${actual_hash}" == "${expected_hash}" ]] || {
+              echo "Committed migration checksum mismatch: ${migration_path}" >&2
+              exit 1
+            }
+          done <<'CHECKSUMS'
+          a9928b0f74532b2a9868827546bcf18fb97086ca310cee3421cccc0ecdfe8f78  drizzle/0000_wet_obadiah_stane.sql
+          61daa01c43f63d54ffe09534ce72e3617c1454f259bceb15e3e7b510fec1c248  drizzle/0001_spooky_freak.sql
+          41948f7a56919b0be9a6b3356298e5b1039b84f29de9e18c7dfa0c18681bba62  drizzle/0002_tired_manta.sql
+          02b78d1df2e7081c1d277c44a8a63e9bd43af36ad6432cf48effa89a9014b6dd  drizzle/0003_lyrical_iron_monger.sql
+          2c8eaab75f31b99185a0e4333f897fbf873f940dbf1ead59e401d5869b979ee5  drizzle/0004_puzzling_tag.sql
+          9641b391a1e43796be88eac8ee6ce34fc80e2e0645a6c6e5dd2e17231ceb5efc  drizzle/0005_optimal_newton_destine.sql
+          a8f46796e64c3b516e29e8946148877aa9236321c66c81f633cad1333d72a03c  drizzle/0006_oval_ultimates.sql
+          1f3df6c92ddea8a92905b20983f8ebd1ba6b2bce98809ff75e9c6d2f0d89056d  drizzle/0007_strange_calypso.sql
+          905ba2617b25cb811c1a1480f83b5648ca611e9f1a9a70be173a91cf52f8024b  drizzle/0008_wealthy_lady_deathstrike.sql
           4ed94d05f1a4a9d4f15d299ba347416251c1dd856954fc9bde878e8b2ecd9e55  drizzle/0009_unusual_black_cat.sql
-          710e382130d2184834b3076d0e3a16ffd1b4e3d3b35f6aa24babe9bf3992db50  drizzle/0010_lonely_boom_boom.sql
+          b0df0eb0dcdfe6df2d9bd5485dad818abc44181abf5623655a9ab44d7b51f148  drizzle/0010_lonely_boom_boom.sql
           CHECKSUMS
 
       - name: Verify authentication and read-only Cloudflare access
