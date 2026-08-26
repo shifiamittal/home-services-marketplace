@@ -58,12 +58,15 @@ Worker or the exact existing private Worker so it remains safe after a partial
 initial rollout. It does not require application tables to be empty and is safe
 after pilot data exists.
 
-Route absence is verified from the exact matched Worker in Cloudflare's
-account-level List Workers response. The workflow does not infer account-wide
-route absence by enumerating only the zones visible to the token. The token
-needs the Workers Scripts read/write access required for deployment and this
-account-level inspection; it does not need zone enumeration solely for this
-safeguard.
+The exact matched Worker's account-level List Workers route metadata is
+validated when Cloudflare reports it: an empty array is accepted and any
+reported route is rejected. Missing or null route metadata is treated as
+unreported, not as independent proof of account-wide route absence. Public
+access remains prevented by the reviewed source and generated configurations
+declaring no routes, disabled Workers.dev and preview URLs, disabled Worker
+subdomain and previews, and an empty custom-domain result filtered to the exact
+Worker. The workflow does not enumerate zones or infer completeness from only
+the zones visible to the token.
 
 ## Deploy the private Worker
 
@@ -87,11 +90,13 @@ an `always()` cleanup step.
 The operation is safely repeatable when an earlier run created the private
 Worker but stopped before installing or verifying every secret. It rejects an
 existing Worker with unexpected bindings, secret names, Workers.dev access,
-preview URLs, account-reported routes, or custom domains. Custom-domain absence
-is checked through Cloudflare's account-level endpoint filtered to the exact
-Worker. Worker Versions are read from the endpoint's documented `result.items`
-envelope, so an existing private Worker remains inspectable during
-partial-deployment recovery.
+preview URLs, any route metadata that Cloudflare reports, or custom domains.
+Missing or null List Workers route metadata remains explicitly unreported;
+private accessibility is established through the independent controls above.
+Custom-domain absence is checked through Cloudflare's account-level endpoint
+filtered to the exact Worker. Worker Versions are read from the endpoint's
+documented `result.items` envelope, so an existing private Worker remains
+inspectable during partial-deployment recovery.
 
 ## Readiness and public access
 
