@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { fixture, jsonRequest, profilePayload, referenceSlot } from "./helpers/local-routes.mjs";
 import { residentDestination, residentManagement, residentLoadDisposition, avatarInitial } from "../app/lib/resident-navigation.ts";
 import { createElement } from "react";
@@ -9,15 +8,47 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 const helperRoute = "app/api/helper/profile/route.ts";
 
-test("committed-schema reproduction: old helper save fails with referenced slots; new save preserves IDs and snapshots", async () => {
+// Minimal historical delete-and-reinsert strategy, exercised against the real
+// checked-in schema. It must fail because of a reference, not a missing source.
+function legacyReplaceAvailability(db) {
+  return db.batch([
+    db.prepare("DELETE FROM availability_slots WHERE helper_user_id = ? AND status IN ('open', 'inactive')").bind("helper"),
+    db.prepare("INSERT INTO availability_slots (id, helper_user_id, day_of_week, start_minute, end_minute, status) VALUES (?, ?, 1, 480, 720, 'open')")
+      .bind("replacement", "helper"),
+  ]);
+}
+
+function assertIssueForm(source, view, categories, selection, feedback, destination) {
+  const form = source.split("\n").find(line => line.includes(`{view === "${view}"`));
+  assert.ok(form, `Missing ${view} form`);
+  const options = form.match(/className="issue-options">\{(\[[^\]]+\])\.map/);
+  assert.ok(options, "Issue categories must be rendered");
+  assert.deepEqual(JSON.parse(options[1]), categories);
+  assert.ok(form.includes(`checked={${selection} === item}`));
+  assert.ok(form.includes(`value={${feedback}}`));
+  assert.match(form, /maxLength=\{1000\}/);
+  assert.ok(form.includes(`disabled={!${selection} || issueBusy}`));
+  assert.match(form, /onClick=\{\(\) => void submitIssue\(\)\}/);
+  assert.match(form, /issueCaseNumber/);
+  assert.ok(form.includes(`navTo("${destination}")`));
+}
+
+test("schema reproduction: legacy destructive save fails with referenced slots; current save preserves IDs and snapshots", async () => {
+  const unreferenced = fixture();
+  try {
+    await legacyReplaceAvailability(unreferenced.db);
+    await legacyReplaceAvailability(unreferenced.db);
+    assert.equal(unreferenced.sql.prepare("SELECT id FROM availability_slots").get().id, "replacement");
+  } finally { unreferenced.sql.close(); }
   const f = fixture();
   try {
     referenceSlot(f, "accepted", "active");
-    const old = execFileSync("git", ["show", "7dde2f5147af338b1f1ab7f657356ec7ac2e5264:" + helperRoute], { encoding: "utf8" });
-    assert.equal((await f.load(helperRoute, old).PUT(jsonRequest(profilePayload))).status, 500);
     const before = f.sql.prepare("SELECT * FROM request_slots").all();
+    const bookingBefore = f.sql.prepare("SELECT * FROM booking_slots").all();
+    await assert.rejects(legacyReplaceAvailability(f.db), /FOREIGN KEY constraint failed/);
     assert.equal((await f.load(helperRoute).PUT(jsonRequest(profilePayload))).status, 200);
     assert.deepEqual(f.sql.prepare("SELECT * FROM request_slots").all(), before);
+    assert.deepEqual(f.sql.prepare("SELECT * FROM booking_slots").all(), bookingBefore);
     assert.equal(f.sql.prepare("SELECT status FROM availability_slots WHERE id='old'").get().status, "open");
     assert.deepEqual(f.sql.prepare("PRAGMA foreign_key_check").all(), []);
     const ids = f.sql.prepare("SELECT id FROM availability_slots ORDER BY id").all();
@@ -215,8 +246,9 @@ test("helper navigation renders all destinations with exactly one active tab, wi
       assert.equal((html.match(/aria-current="page"/g) || []).length, 1);
     }
     const current = readFileSync("app/page.tsx", "utf8").split("\n");
-    const original = execFileSync("git", ["show", "HEAD:app/page.tsx"], { encoding: "utf8" }).split("\n");
-    assert.equal(current.find(line => line.includes('{view === "providerIssue"')), original.find(line => line.includes('{view === "providerIssue"')));
+    assertIssueForm(current.join("\n"), "providerIssue",
+      ["Resident was unavailable", "Work requested was different", "Payment is overdue", "Safety or misconduct", "I need to end this job", "Something else"],
+      "providerIssue", "providerIssueFeedback", "providerDashboard");
     assert.ok(current.some(line => line.includes("Help &amp; support") && line.includes("onClick={openIssueReport}")));
   } finally { f.sql.close(); }
 });
@@ -336,8 +368,9 @@ test("late client loads neither erase a newer commitment nor replace a chosen li
   assert.match(source, /if \(!disposition.accept\) return residentStateRef.current.request/);
   assert.match(source, /residentStateRef.current = \{ request: saved, payment: result.paymentPending/);
   assert.match(source, /residentProfileReady \? <><Field label="What services/);
-  const base = execFileSync("git", ["show", "HEAD:app/page.tsx"], { encoding: "utf8" });
-  assert.equal(source.split("\n").find(line => line.includes('{view === "issue"')), base.split("\n").find(line => line.includes('{view === "issue"')));
+  assertIssueForm(source, "issue",
+    ["Helper did not arrive", "Timing did not work", "Not satisfied with service", "Safety or misconduct", "Something else"],
+    "residentIssue", "residentIssueFeedback", "dashboard");
 });
 
 test("actual resident loader retains incomplete booking/payment state and ignores stale navigation/results", async () => {

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { fixture } from "./helpers/local-routes.mjs";
 
 const route = "app/api/helper/address-proof/route.ts";
@@ -12,12 +11,21 @@ function upload() {
   return new Request("https://example.test/api", { method: "POST", headers: { origin: "https://example.test" }, body: form });
 }
 
-test("proof simplification restores the exact reviewed base backend, not a new cleanup protocol", () => {
-  const base = execFileSync("git", ["show", "7dde2f5147af338b1f1ab7f657356ec7ac2e5264:" + route], { encoding: "utf8" });
-  assert.equal(readFileSync(route, "utf8").replaceAll("\r\n", "\n"), base.replaceAll("\r\n", "\n"));
+test("proof upload has no durable operation-ID, staging or cleanup protocol", () => {
+  const backend = readFileSync(route, "utf8");
   const page = readFileSync("app/page.tsx", "utf8");
-  assert.match(page, /form.append\("file", retry.file\)/);
-  assert.doesNotMatch(page, /uploadId|upload_staged|superseded_cleaned/);
+  const start = page.indexOf("  const uploadAddressProof =");
+  const end = page.indexOf("  const saveHelperProfile =", start);
+  assert.ok(start >= 0 && end > start);
+  const client = page.slice(start, end);
+  assert.deepEqual([...backend.matchAll(/form.get\("([^"]+)"\)/g)].map(match => match[1]), ["file", "documentType"]);
+  assert.deepEqual([...client.matchAll(/form.append\("([^"]+)"/g)].map(match => match[1]), ["file", "documentType"]);
+  assert.match(backend, /const documentId = crypto.randomUUID\(\)/);
+  assert.match(client, /form.append\("file", retry.file\)/);
+  assert.match(client, /proofRetryRef.current = \{ file, documentType: addressProofType \}/);
+  assert.match(client, /proofRetryRef.current = null/);
+  assert.doesNotMatch(client, /localStorage|sessionStorage|indexedDB/);
+  assert.doesNotMatch(backend + client, /upload[_-]?id|operation[_-]?id|idempotency|upload_staged|superseded_cleaned|staging|proof_cleanup/i);
 });
 
 test("base upload uses fresh server identities and preserves helper moderation", async () => {
