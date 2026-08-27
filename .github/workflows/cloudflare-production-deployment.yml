@@ -543,6 +543,45 @@ jobs:
             /get\(\s*`\/accounts\/\$\{account\}\/workers\/domains\?service=\$\{encodeURIComponent\(worker\)\}`,\s*false,\s*true,\s*\)/,
           );
           assert.equal(reviewedWorkflow.includes("get(`/accounts/${account}/workers/domains`)"), false);
+          // Exercise the production parser itself, not a duplicate implementation.
+          const namespaceSource = reviewedWorkflow.match(/function parseAccountSubdomain\(body, workerName\) \{[\s\S]*?\n          \}/)?.[0];
+          assert.ok(namespaceSource);
+          const parseNamespace = new Function(`${namespaceSource}; return parseAccountSubdomain;`)();
+          const namespace = (body, status = 200) => {
+            if (status < 200 || status >= 300) throw new Error('HTTP failure');
+            return parseNamespace(envelope(body), 'nivasa-home-help');
+          };
+          const validNamespace = ok({ subdomain: 'nivasa-app' });
+          assert.equal(namespace(validNamespace), 'https://nivasa-home-help.nivasa-app.workers.dev');
+          for (const result of [undefined, null, [], 'nivasa-app', 1, true, {},
+            ...[null, '', ' ', 'wrong', 1, false, [], {}].map((subdomain) => ({ subdomain }))]) {
+            assert.throws(() => namespace(ok(result)));
+          }
+          for (const body of [null, [], 'invalid', {}, { success: true, result: validNamespace.result },
+            { ...validNamespace, success: false }, { ...validNamespace, errors: ['error'] }]) {
+            assert.throws(() => namespace(body));
+          }
+          assert.throws(() => namespace(validNamespace, 403));
+          assert.throws(() => namespace(JSON.parse('{')));
+          assert.throws(() => parseNamespace(validNamespace, 'wrong-worker'));
+          const simulateStages = (bodies, deploy) => {
+            namespace(bodies[0]); // initial/preflight
+            namespace(bodies[1]); // fresh, before mutation
+            deploy();
+            return namespace(bodies[2]); // final verification
+          };
+          let deployed = false;
+          const wrongNamespace = ok({ subdomain: 'wrong' });
+          assert.throws(() => simulateStages([validNamespace, wrongNamespace, validNamespace], () => { deployed = true; }));
+          assert.equal(deployed, false);
+          assert.throws(() => simulateStages([validNamespace, validNamespace, wrongNamespace], () => { deployed = true; }));
+          assert.equal(deployed, true);
+          assert.equal(simulateStages([validNamespace, validNamespace, validNamespace], () => {}),
+            'https://nivasa-home-help.nivasa-app.workers.dev');
+          assert.ok(reviewedWorkflow.includes('parseAccountSubdomain(await get(`/accounts/${account}/workers/subdomain`), worker)'));
+          for (const stage of ['preflight', 'fresh', 'final']) {
+            assert.match(reviewedWorkflow, new RegExp(`STATE_PATH="\\$\\{RUNNER_TEMP\\}/nivasa-${stage}-state\\.json"[^\\n]*\\\\\\n\\s*node "\\$\\{RUNNER_TEMP\\}/nivasa-inspect-cloudflare\\.mjs"`));
+          }
           console.log('Static workflow security boundaries verified.');
           NODE
 
@@ -709,6 +748,20 @@ jobs:
             return body.result.items[0]?.id ?? null;
           }
 
+          function parseAccountSubdomain(body, workerName) {
+            if (!body.result || typeof body.result !== 'object' || Array.isArray(body.result)
+                || !Object.hasOwn(body.result, 'subdomain')
+                || typeof body.result.subdomain !== 'string' || body.result.subdomain !== 'nivasa-app') {
+              throw new Error('Workers.dev account namespace is unexpected');
+            }
+            if (workerName !== 'nivasa-home-help') throw new Error('Unexpected Worker name');
+            const publicUrl = `https://${workerName}.${body.result.subdomain}.workers.dev`;
+            if (publicUrl !== 'https://nivasa-home-help.nivasa-app.workers.dev') {
+              throw new Error('Derived Workers.dev URL is unexpected');
+            }
+            return publicUrl;
+          }
+          const publicUrl = parseAccountSubdomain(await get(`/accounts/${account}/workers/subdomain`), worker);
           const scripts = await get(`/accounts/${account}/workers/scripts`);
           const matchedWorker = parseWorkers(scripts);
           const workerExists = matchedWorker !== null;
@@ -761,7 +814,7 @@ jobs:
           if (process.env.REQUIRE_WORKER === '1' && !workerExists) throw new Error('Expected Worker does not exist');
           if (process.env.REQUIRE_ALL_SECRETS === '1'
               && JSON.stringify(secretNames) !== JSON.stringify(expectedSecrets)) throw new Error('Expected Worker secret names are incomplete');
-          const state = { workerExists, secretNames, versionId, workersDevEnabled, previewsEnabled: false, r2Private: true };
+          const state = { workerExists, secretNames, versionId, publicUrl, workersDevEnabled, previewsEnabled: false, r2Private: true };
           fs.writeFileSync(process.env.STATE_PATH, JSON.stringify(state), { mode: 0o600 });
           console.log(workerExists ? 'Existing exact Worker state verified.' : 'No conflicting Worker exists.');
           NODE
@@ -876,10 +929,9 @@ jobs:
           if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Final D1 migration ledger is unexpected');
           NODE
           version_id="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(!s.versionId)process.exit(1); process.stdout.write(s.versionId)")"
-          expected_url="${EXPECTED_WORKERS_DEV_URL}"
-          [[ "${expected_url}" == 'https://nivasa-home-help.nivasa-app.workers.dev' ]] || exit 1
+          verified_url="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(s.publicUrl!==process.env.EXPECTED_WORKERS_DEV_URL)process.exit(1); process.stdout.write(s.publicUrl)")"
           echo "Verified public Worker version: ${version_id}"
-          echo "Workers.dev production URL verified: ${expected_url}"
+          echo "Workers.dev production URL verified from live account namespace: ${verified_url}"
           echo 'Final Worker bindings, secret names, D1 ledger, R2 privacy, Workers.dev access, and preview isolation verified.'
 
       - name: Remove temporary deployment material

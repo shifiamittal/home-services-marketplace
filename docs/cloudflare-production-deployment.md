@@ -97,8 +97,11 @@ requires Workers.dev to be enabled, preview URLs to be disabled, the filtered
 custom-domain result to remain empty, every reported route list to be empty,
 the exact four bindings and eight secret names to remain present, a usable
 Worker version, the exact D1 migration state, and private R2 storage. The final
-URL is constructed from reviewed constants and structurally validated as HTTPS
-with the exact hostname, root path, and no query or fragment.
+URL is derived from the exact Worker name and Cloudflare's authenticated live
+account namespace, which must equal `nivasa-app`. The account-subdomain GET is
+validated during preflight, fresh pre-deployment inspection, and final
+verification. Missing, malformed or different namespace metadata fails closed;
+the derived URL must equal the exact reviewed HTTPS hostname above.
 
 The operation supports recovery from a prior public deployment whose upload
 succeeded but whose final verification was interrupted. The fresh inspection
