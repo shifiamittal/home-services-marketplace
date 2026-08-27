@@ -5,9 +5,8 @@
   "compatibility_date": "2026-08-25",
   "compatibility_flags": ["nodejs_compat"],
   "main": "./worker/index.ts",
-  // Deliberately enable public access only after migrations, secrets, and
-  // provider-domain restrictions are complete.
-  "workers_dev": false,
+  // Public production access is limited to the reviewed Workers.dev hostname.
+  "workers_dev": true,
   "preview_urls": false,
   "assets": {
     "directory": "./dist/client",
