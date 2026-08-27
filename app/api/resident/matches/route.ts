@@ -1,3 +1,4 @@
+import { requireCompleteResident } from "../../../lib/profile-completeness";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 
 type Service = "house_cleaning" | "utensils_once" | "utensils_twice" | "house_plus_utensils_once" | "house_plus_utensils_twice";
@@ -111,6 +112,8 @@ export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
     const session = await requireResident(request);
+    const db = await getD1();
+    await requireCompleteResident(db, session.user_id);
     const body = await request.json() as Record<string, unknown>;
     const service = body.service as Service;
     const homeSize = body.homeSize as HomeSize;
@@ -126,7 +129,6 @@ export async function POST(request: Request) {
       return Response.json({ error: "Choose a valid service, home size and preferred time." }, { status: 400 });
     }
 
-    const db = await getD1();
     const unpaidTrial = await db.prepare(
       `SELECT id FROM trial_payments WHERE resident_user_id = ?
        AND status IN ('pending', 'resident_marked_paid') LIMIT 1`,

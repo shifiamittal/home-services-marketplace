@@ -1,10 +1,12 @@
+import { residentProfileComplete } from "../../../lib/profile-completeness";
 import { getD1, getSession } from "../../../lib/auth";
 
 export async function GET(request: Request) {
   try {
     const session = await getSession(request);
     if (!session) return Response.json({ authenticated: false }, { status: 401 });
-    let profileComplete = Boolean(session.name.trim());
+    let profileComplete = session.role === "resident"
+      ? await residentProfileComplete(await getD1(), session.user_id) : Boolean(session.name.trim());
     if (session.role === "provider" && profileComplete) {
       const db = await getD1();
       const profile = await db.prepare(

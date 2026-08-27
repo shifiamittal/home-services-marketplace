@@ -1,5 +1,8 @@
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 
+import { fieldError, profileFailure } from "../../../lib/profile-errors";
+import { saveAvailability } from "../../../lib/profile-availability";
+
 type ServiceKey = "house_cleaning" | "utensils_once" | "utensils_twice";
 type HomeSize = "one_two_bhk" | "three_bhk" | "four_plus_bhk" | "not_applicable";
 type DayPattern = "mon_sat" | "mon_fri" | "every_day";
@@ -49,7 +52,7 @@ export async function GET(request: Request) {
       `SELECT original_filename, document_type, status, created_at
        FROM verification_documents
        WHERE helper_user_id = ? AND status != 'deleted'
-       ORDER BY created_at DESC LIMIT 1`,
+       ORDER BY CASE WHEN status IN ('pending', 'verified') THEN 0 ELSE 1 END, created_at DESC, id LIMIT 1`,
     ).bind(session.user_id).first<Record<string, string>>();
 
     const grouped = new Map<string, { id: string; days: DayPattern; start: string; end: string }>();
@@ -95,7 +98,7 @@ export async function PUT(request: Request) {
   try {
     assertSameOrigin(request);
     const session = await requireHelper(request);
-    const body = await request.json() as {
+    const body = await request.json().catch(() => null) as null | {
       locality?: unknown;
       homeAddress?: unknown;
       latitude?: unknown;
@@ -105,27 +108,28 @@ export async function PUT(request: Request) {
       offerings?: unknown;
       availability?: unknown;
     };
+    if (!body || typeof body !== "object" || Array.isArray(body)) return fieldError("profile", "Provide a valid profile.");
     const locality = typeof body.locality === "string" ? body.locality.trim() : "";
     const homeAddress = typeof body.homeAddress === "string" ? body.homeAddress.trim() : "";
-    const latitude = Number(body.latitude);
-    const longitude = Number(body.longitude);
+    const latitude = typeof body.latitude === "number" ? body.latitude : NaN;
+    const longitude = typeof body.longitude === "number" ? body.longitude : NaN;
     const travelDistanceKm = Number(body.travelDistanceKm);
     const yearsExperience = Number(body.yearsExperience);
     if (!locality || locality.length > 160 || !homeAddress || homeAddress.length > 300 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
-      return Response.json({ error: "Choose your starting address from Google suggestions." }, { status: 400 });
+      return fieldError("address", "Choose your starting address from Google suggestions.");
     }
     if (!Number.isFinite(travelDistanceKm) || travelDistanceKm <= 0 || travelDistanceKm > 500) {
-      return Response.json({ error: "Enter an approximate travel distance in kilometres." }, { status: 400 });
+      return fieldError("travelDistanceKm", "Enter an approximate travel distance in kilometres.");
     }
     if (!Number.isInteger(yearsExperience) || yearsExperience < 0 || yearsExperience > 60) {
-      return Response.json({ error: "Enter valid years of experience." }, { status: 400 });
+      return fieldError("yearsExperience", "Enter valid years of experience.");
     }
 
     const rawOfferings = Array.isArray(body.offerings) ? body.offerings : [];
     const offerings: Array<{ serviceType: ServiceKey; homeSize: HomeSize; monthlyPricePaise: number }> = [];
     const offeringKeys = new Set<string>();
     for (const item of rawOfferings) {
-      if (!item || typeof item !== "object") continue;
+      if (!item || typeof item !== "object" || Array.isArray(item)) return fieldError("offerings", "Choose valid service prices.");
       const value = item as Record<string, unknown>;
       const serviceType = value.serviceType as ServiceKey;
       const homeSize = value.homeSize as HomeSize;
@@ -135,35 +139,36 @@ export async function PUT(request: Request) {
         ? ["one_two_bhk", "three_bhk", "four_plus_bhk"].includes(homeSize)
         : homeSize === "not_applicable";
       if (!validService || !validHomeSize || !Number.isInteger(monthlyPriceRupees) || monthlyPriceRupees < 100 || monthlyPriceRupees > 100_000) {
-        return Response.json({ error: "Enter a valid monthly price for every selected service." }, { status: 400 });
+        return fieldError("offerings", "Enter a valid monthly price for every selected service.");
       }
       const key = `${serviceType}:${homeSize}`;
-      if (offeringKeys.has(key)) return Response.json({ error: "A service price was entered more than once." }, { status: 400 });
+      if (offeringKeys.has(key)) return fieldError("offerings", "A service price was entered more than once.");
       offeringKeys.add(key);
       offerings.push({ serviceType, homeSize, monthlyPricePaise: monthlyPriceRupees * 100 });
     }
-    if (!offerings.length) return Response.json({ error: "Select at least one service." }, { status: 400 });
+    if (!offerings.length) return fieldError("offerings", "Select at least one service.");
 
     const rawAvailability = Array.isArray(body.availability) ? body.availability : [];
+    if (rawAvailability.length > 28) return fieldError("availability", "Use at most 28 recurring windows.");
     const availability: Array<{ id: string; pattern: DayPattern; start: number; end: number }> = [];
     for (const item of rawAvailability) {
-      if (!item || typeof item !== "object") continue;
+      if (!item || typeof item !== "object" || Array.isArray(item)) return fieldError("availability", "Choose valid recurring windows.");
       const value = item as Record<string, unknown>;
       const pattern = value.days as DayPattern;
       const start = minuteOfDay(value.start);
       const end = minuteOfDay(value.end);
-      if (!(pattern in patternDays) || start < 0 || end < 0 || end - start < 30) {
-        return Response.json({ error: "Each available time must be at least 30 minutes and end after it starts." }, { status: 400 });
+      if (!Object.hasOwn(patternDays, pattern) || start < 0 || end < 0 || end - start < 30) {
+        return fieldError("availability", "Each available time must be at least 30 minutes and end after it starts.");
       }
       availability.push({ id: crypto.randomUUID(), pattern, start, end });
     }
-    if (!availability.length) return Response.json({ error: "Add at least one available time." }, { status: 400 });
+    if (!availability.length) return fieldError("availability", "Add at least one available time.");
 
     for (let first = 0; first < availability.length; first += 1) {
       for (let second = first + 1; second < availability.length; second += 1) {
         const sharesDay = patternDays[availability[first].pattern].some(day => patternDays[availability[second].pattern].includes(day));
         if (sharesDay && availability[first].start < availability[second].end + 15 && availability[second].start < availability[first].end + 15) {
-          return Response.json({ error: "Available times on the same day need a 15-minute travel buffer." }, { status: 400 });
+          return fieldError("availability", "Available times on the same day need a 15-minute travel buffer.");
         }
       }
     }
@@ -175,7 +180,7 @@ export async function PUT(request: Request) {
        ORDER BY created_at DESC LIMIT 1`,
     ).bind(session.user_id).first<{ id: string }>();
     if (!addressProof) {
-      return Response.json({ error: "Upload a valid address-proof document before publishing your profile." }, { status: 409 });
+      return fieldError("addressProof", "Upload a valid address-proof document before publishing your profile.", 409);
     }
     const statements = [
       db.prepare(
@@ -185,10 +190,11 @@ export async function PUT(request: Request) {
          ON CONFLICT(user_id) DO UPDATE SET home_locality = excluded.home_locality, home_address = excluded.home_address,
          latitude_e6 = excluded.latitude_e6, longitude_e6 = excluded.longitude_e6,
          max_travel_distance_meters = excluded.max_travel_distance_meters, years_experience = excluded.years_experience,
-         profile_status = 'active', updated_at = CURRENT_TIMESTAMP`,
+         profile_status = CASE WHEN helper_profiles.profile_status IN ('draft', 'active')
+           THEN 'active' ELSE helper_profiles.profile_status END, updated_at = CURRENT_TIMESTAMP`,
       ).bind(session.user_id, locality, homeAddress, Math.round(latitude * 1_000_000), Math.round(longitude * 1_000_000), Math.round(travelDistanceKm * 1_000), yearsExperience),
       db.prepare("DELETE FROM helper_offerings WHERE helper_user_id = ?").bind(session.user_id),
-      db.prepare("DELETE FROM availability_slots WHERE helper_user_id = ? AND status IN ('open', 'inactive')").bind(session.user_id),
+      ...saveAvailability(db, session.user_id, availability.flatMap(group => patternDays[group.pattern].map(day => ({ day, start: group.start, end: group.end, pattern: group.pattern })))),
     ];
     for (const offering of offerings) {
       statements.push(db.prepare(
@@ -196,22 +202,18 @@ export async function PUT(request: Request) {
          VALUES (?, ?, ?, ?, ?, 1)`,
       ).bind(crypto.randomUUID(), session.user_id, offering.serviceType, offering.homeSize, offering.monthlyPricePaise));
     }
-    for (const group of availability) {
-      for (const day of patternDays[group.pattern]) {
-        statements.push(db.prepare(
-          `INSERT INTO availability_slots (id, helper_user_id, source_group_id, day_pattern, day_of_week, start_minute, end_minute, buffer_minutes, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 15, 'open')`,
-        ).bind(crypto.randomUUID(), session.user_id, group.id, group.pattern, day, group.start, group.end));
-      }
-    }
     statements.push(db.prepare(
       "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'helper_profile_saved', ?)",
     ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ offeringCount: offerings.length, availabilityGroupCount: availability.length, travelDistanceKm })));
     await db.batch(statements);
-    return Response.json({ saved: true, combinedPricesCalculated: true });
+    const saved = await db.prepare("SELECT profile_status FROM helper_profiles WHERE user_id = ?").bind(session.user_id).first<{ profile_status: string }>();
+    return Response.json({ saved: true, profileStatus: saved?.profile_status, combinedPricesCalculated: true });
   } catch (error) {
     if (error instanceof Response) return error;
-    return Response.json({ error: "We could not save your work profile. Please try again." }, { status: 500 });
+    if (error instanceof Error && error.message.includes("malformed JSON")) {
+      return fieldError("availability", "These hours would exclude a pending request or booked service. Keep its time available.", 409);
+    }
+    return profileFailure("profile_save");
   }
 }
 
