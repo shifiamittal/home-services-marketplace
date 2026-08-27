@@ -1,3 +1,4 @@
+import { residentProfileComplete, validDisplayName } from "../../../lib/profile-completeness";
 import { AppRole, assertSameOrigin, getD1, getSession, roleForStorage } from "../../../lib/auth";
 
 export async function POST(request: Request) {
@@ -20,7 +21,7 @@ export async function POST(request: Request) {
     }
     const role = body.role as AppRole;
     const name = typeof body.name === "string" ? body.name.trim() : "";
-    if (!name || body.termsAccepted !== true) {
+    if (!validDisplayName(name) || body.termsAccepted !== true) {
       return Response.json({ error: "Complete the required details and accept the Terms and Privacy Policy." }, { status: 400 });
     }
     if (role === "resident") {
@@ -28,8 +29,8 @@ export async function POST(request: Request) {
       const house = typeof body.house === "string" ? body.house.trim() : "";
       const locality = typeof body.locality === "string" ? body.locality.trim() : "";
       const formattedAddress = typeof body.formattedAddress === "string" ? body.formattedAddress.trim() : "";
-      const latitude = Number(body.latitude);
-      const longitude = Number(body.longitude);
+      const latitude = typeof body.latitude === "number" ? body.latitude : NaN;
+      const longitude = typeof body.longitude === "number" ? body.longitude : NaN;
       if (!house || !locality || !formattedAddress || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
         return Response.json({ error: "Enter your house number and choose your address from Google suggestions." }, { status: 400 });
       }
@@ -58,7 +59,9 @@ export async function POST(request: Request) {
         "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'account_onboarding_completed', ?)",
       ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ role })),
     ]);
-    return Response.json({ completed: true, user: { name, role } });
+    return Response.json({ completed: true,
+      profileComplete: role === "resident" ? await residentProfileComplete(db, session.user_id) : false,
+      user: { name, role } });
   } catch (error) {
     if (error instanceof Response) return error;
     return Response.json({ error: "We could not save your account. Please try again." }, { status: 500 });

@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { GoogleAddressField, SelectedAddress } from "./components/google-address-field";
+import { HelperNavigation } from "./components/helper-navigation";
+import { avatarInitial, residentDestination, residentManagement, residentLoadDisposition } from "./lib/resident-navigation";
 import type { BookingWorkflowState } from "./lib/booking-workflow";
 
 type Role = "resident" | "provider";
@@ -221,7 +223,6 @@ export default function Home() {
   const [cancelFeedback, setCancelFeedback] = useState("");
   const [cancelBusy, setCancelBusy] = useState(false);
   const [cancelError, setCancelError] = useState("");
-  const [paymentOpen, setPaymentOpen] = useState(false);
   const [trialPayment, setTrialPayment] = useState<TrialPayment | null>(null);
   const [paymentBusy, setPaymentBusy] = useState(false);
   const [paymentError, setPaymentError] = useState("");
@@ -241,6 +242,17 @@ export default function Home() {
   const [addressProofName, setAddressProofName] = useState("");
   const [addressProofType, setAddressProofType] = useState("aadhaar");
   const [proofUploading, setProofUploading] = useState(false);
+  const [savedResidentName, setSavedResidentName] = useState("");
+  const residentDraftTouched = useRef(false);
+  const residentCompleteRef = useRef(false);
+  const [residentProfileReady, setResidentProfileReady] = useState(false);
+  const residentStateRef = useRef<{ request: StoredRequest | null; payment: TrialPayment | null }>({ request: null, payment: null });
+  const residentLoadRef = useRef(0);
+  const residentNavigationRef = useRef(0);
+  const helperDraftLoaded = useRef(false);
+  const proofRetryRef = useRef<{ file: File; documentType: string } | null>(null);
+  const [proofRetryAvailable, setProofRetryAvailable] = useState(false);
+  const [savedProfileStatus, setSavedProfileStatus] = useState("draft");
   const proofInputRef = useRef<HTMLInputElement | null>(null);
   const analyticsSessionId = useRef("");
   const [setupSubmitted, setSetupSubmitted] = useState(false);
@@ -303,7 +315,6 @@ export default function Home() {
     return rows;
   }, [houseCleaningEnabled, housePrices, utensilsOnceEnabled, utensilsOncePrice, utensilsTwiceEnabled, utensilsTwicePrice]);
   const invalidTimes = twice && (!firstTime || !secondTime || secondTime <= firstTime);
-  const betaMode = true;
 
   function recordClientEvent(eventName: string, properties: Record<string, string> = {}) {
     if (!analyticsSessionId.current) {
@@ -350,6 +361,8 @@ export default function Home() {
       setBooking("draft");
       setTrialPayment(result.paymentPending ?? null);
       if (role === "resident") {
+        residentLoadRef.current += 1;
+        residentStateRef.current = { request: null, payment: result.paymentPending ?? null };
         setCurrentRequest(null);
         setSelectedHelperId("");
         setPeople([]);
@@ -357,7 +370,7 @@ export default function Home() {
           ? `Booking cancelled. ₹${result.paymentDueRupees.toLocaleString("en-IN")} remains payable for completed trial work.`
           : "Booking cancelled. The recurring time has been released and you can search again.");
         navTo("requirement");
-        await loadResidentRequest(false);
+        await loadResidentRequest(!residentCompleteRef.current);
       } else {
         setHelperActiveBooking(null);
         navTo("providerDashboard");
@@ -406,7 +419,7 @@ export default function Home() {
       });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || "We could not update this payment.");
-      if (role === "resident") await loadResidentRequest(false);
+      if (role === "resident") await loadResidentRequest(!residentCompleteRef.current);
       else await loadHelperRequests(false);
       void loadNotifications(false);
     } catch (error) {
@@ -454,6 +467,7 @@ export default function Home() {
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || "We could not update your profile availability.");
       setProfilePaused(paused);
+      setSavedProfileStatus(paused ? "paused" : "active");
     } catch (error) {
       setSetupError(providerMessage(error, "We could not update your profile availability."));
     } finally {
@@ -483,35 +497,44 @@ export default function Home() {
   }
 
   async function loadResidentRequest(redirect = true) {
+    const load = ++residentLoadRef.current;
+    const navigation = residentNavigationRef.current;
     try {
       const response = await fetch("/api/resident/requests", { credentials: "same-origin" });
       const result = await response.json() as { error?: string; workflowState?: BookingWorkflowState; request?: StoredRequest | null; paymentPending?: TrialPayment | null };
       if (!response.ok) throw new Error(result.error || "We could not load your booking request.");
+      const disposition = residentLoadDisposition(load, residentLoadRef.current, navigation, residentNavigationRef.current);
+      if (!disposition.accept) return residentStateRef.current.request;
       const saved = result.request ?? null;
       const workflowState = result.workflowState ?? saved?.workflowState ?? "ready_to_search";
+      residentStateRef.current = { request: saved, payment: result.paymentPending ?? null };
+      const management = residentManagement(saved, result.paymentPending ?? null);
       setCurrentRequest(saved);
       setTrialPayment(result.paymentPending ?? null);
-      const shouldSyncView = redirect || ["pending", "confirmed", "dashboard"].includes(view);
+      const shouldSyncView = disposition.navigate && (redirect || ["pending", "confirmed", "dashboard"].includes(view) || (!residentCompleteRef.current && view === "requirement"));
+      const syncView = (destination: string) => {
+        if (shouldSyncView) setView(residentDestination(residentCompleteRef.current, destination, management));
+      };
       if (workflowState === "request_pending") {
         setBooking("pending");
-        if (shouldSyncView) setView("pending");
+        syncView("pending");
       } else if (workflowState === "booking_trial") {
         setBooking("booked");
-        if (shouldSyncView) setView(view === "dashboard" ? "dashboard" : "confirmed");
+        syncView(view === "dashboard" ? "dashboard" : "confirmed");
       } else if (workflowState === "booking_active" || workflowState === "booking_ending") {
         setBooking(workflowState === "booking_ending" ? "ending" : "active");
-        if (shouldSyncView) setView("dashboard");
+        syncView("dashboard");
       } else if (["booking_cancelled", "booking_completed", "trial_payment_due", "trial_payment_confirmation_pending", "trial_payment_under_review", "request_withdrawn", "ready_to_search"].includes(workflowState)) {
         setBooking("draft");
-        if (shouldSyncView) setView("requirement");
+        syncView("requirement");
       } else if (workflowState === "request_declined" || workflowState === "request_expired") {
         setBooking("draft");
         setMatchesError(workflowState === "request_declined" ? `${saved?.helperName || "The helper"} was not available for this request. Choose another match.` : "The 24-hour response window ended. Choose another available match.");
-        if (shouldSyncView) setView("requirement");
+        syncView("requirement");
       } else if (workflowState === "inconsistent") {
         setBooking("draft");
         setRequestError("Your booking could not be confirmed completely. Please try again or report the issue.");
-        if (shouldSyncView) setView("requirement");
+        syncView("requirement");
       }
       return saved;
     } catch (error) {
@@ -534,11 +557,8 @@ export default function Home() {
       else if (result.activeBooking?.bookingStatus === "active") setBooking("active");
       else if (result.activeBooking?.bookingStatus === "ending") setBooking("ending");
       else if (!result.pendingRequest) setBooking("draft");
-      if (result.pendingRequest) {
-        if (redirect || ["incoming", "providerDashboard"].includes(view)) setView("incoming");
-      } else if (view === "incoming") {
-        setView("providerDashboard");
-      }
+      // Loading bookings must not steal the selected navigation destination.
+      void redirect;
       return result;
     } catch (error) {
       setSetupError(providerMessage(error, "We could not load your booking requests."));
@@ -673,10 +693,12 @@ export default function Home() {
       const result = await response.json() as { error?: string; profileComplete?: boolean; user?: { name?: string; mobile?: string } };
       if (!response.ok) throw new Error(result.error || "We could not complete sign-in.");
       if (result.user?.name) {
-        if (accountRole === "resident") setResidentName(result.user.name);
+        if (accountRole === "resident") { setResidentName(result.user.name); setSavedResidentName(result.user.name); }
         else setHelperName(result.user.name);
       }
       if (result.user?.mobile) setMobile(result.user.mobile.replace(/^\+91/, ""));
+      residentCompleteRef.current = accountRole === "resident" && result.profileComplete === true;
+      setResidentProfileReady(residentCompleteRef.current);
       setSignedIn(true);
       setView(result.profileComplete ? (accountRole === "resident" ? "requirement" : "providerDashboard") : (accountRole === "resident" ? "residentAccount" : "helperAccount"));
       window.scrollTo({ top: 0, behavior: "smooth" });
@@ -692,12 +714,14 @@ export default function Home() {
       .then(async response => response.ok ? response.json() as Promise<{ user: { role: AccountRole; name: string; mobile: string }; profileComplete: boolean }> : null)
       .then(session => {
         if (!active || !session) return;
+        residentCompleteRef.current = session.user.role === "resident" && session.profileComplete === true;
+        setResidentProfileReady(residentCompleteRef.current);
         setAccountRole(session.user.role);
         setRole(session.user.role);
         setSignedIn(true);
         setMobile(session.user.mobile.replace(/^\+91/, ""));
         if (session.user.name) {
-          if (session.user.role === "resident") setResidentName(session.user.name);
+          if (session.user.role === "resident") { setResidentName(session.user.name); setSavedResidentName(session.user.name); }
           else setHelperName(session.user.name);
         }
         setView(session.profileComplete ? (session.user.role === "resident" ? "requirement" : "providerDashboard") : (session.user.role === "resident" ? "residentAccount" : "helperAccount"));
@@ -717,7 +741,7 @@ export default function Home() {
       .then(async response => response.ok ? response.json() as Promise<{ address?: { house?: string; formattedAddress?: string; locality?: string; latitude?: number | null; longitude?: number | null } | null }> : null)
       .then(result => {
         const address = result?.address;
-        if (!address) return;
+        if (!address || residentDraftTouched.current) return;
         setResidentHouse(address.house || "");
         if (address.formattedAddress && address.locality && typeof address.latitude === "number" && typeof address.longitude === "number") {
           setResidentAddress({ formattedAddress: address.formattedAddress, locality: address.locality, latitude: address.latitude, longitude: address.longitude });
@@ -749,9 +773,10 @@ export default function Home() {
   useEffect(() => {
     const providerView = view === "setup" || view === "providerDashboard" || view === "providerSettings";
     if (!providerView || !signedIn || accountRole !== "provider") return;
+    const hydrateDraft = !helperDraftLoaded.current;
     let active = true;
-    if (view === "setup") setSetupLoading(true);
-    setSetupError("");
+    if (view === "setup" && hydrateDraft) setSetupLoading(true);
+    if (hydrateDraft) setSetupError("");
     fetch("/api/helper/profile", { credentials: "same-origin" })
       .then(async response => {
         const result = await response.json() as {
@@ -763,6 +788,10 @@ export default function Home() {
         };
         if (!response.ok) throw new Error(result.error || "We could not load your work profile.");
         if (!active) return;
+        setSavedProfileStatus(result.profile?.profileStatus || "draft");
+        setProfilePaused(result.profile?.profileStatus === "paused");
+        if (!hydrateDraft) return;
+        helperDraftLoaded.current = true;
         if (result.profile) {
           setHelperLocality(result.profile.locality || "");
           if (result.profile.homeAddress && typeof result.profile.latitude === "number" && typeof result.profile.longitude === "number") {
@@ -776,6 +805,7 @@ export default function Home() {
           setHelperTravelDistance(result.profile.travelDistanceKm ? String(result.profile.travelDistanceKm) : "");
           setYearsExperience(String(result.profile.yearsExperience ?? 0));
           setProfilePaused(result.profile.profileStatus === "paused");
+          setSavedProfileStatus(result.profile.profileStatus || "draft");
         }
         if (result.offerings?.length) {
           const activeOfferings = result.offerings.filter(item => Boolean(item.is_active));
@@ -796,7 +826,7 @@ export default function Home() {
         }
         if (result.availability?.length) setAvailabilitySlots(result.availability);
         if (result.addressProof) {
-          setAddressProofUploaded(true);
+          setAddressProofUploaded(["pending", "verified"].includes(result.addressProof.status));
           setAddressProofName(result.addressProof.filename);
           setAddressProofType(result.addressProof.documentType);
         }
@@ -855,8 +885,11 @@ export default function Home() {
     return () => { active = false; };
   }, [view, accountRole]);
   const navTo = (next: string) => {
-    let destination = next;
+    residentNavigationRef.current += 1;
+    let destination = next === "membership" ? "dashboard" : next;
     if (signedIn && role === "resident") {
+      const currentRequest = residentStateRef.current.request;
+      const paymentBlocking = ["pending", "resident_marked_paid"].includes(residentStateRef.current.payment?.status || "");
       const hasPendingRequest = currentRequest?.workflowState === "request_pending" || currentRequest?.status === "pending";
       const hasLiveBooking = Boolean(currentRequest?.bookingId && ["trial", "active", "ending"].includes(currentRequest.bookingStatus || ""));
       const hasTrialBooking = currentRequest?.bookingStatus === "trial";
@@ -865,11 +898,12 @@ export default function Home() {
       if (["dashboard", "membership"].includes(destination) && !hasLiveBooking) destination = "requirement";
       if (["matches", "profile", "review"].includes(destination) && paymentBlocking) destination = "requirement";
     }
-    if (signedIn && role === "provider" && destination === "incoming" && !helperRequest) destination = "providerDashboard";
+    if (signedIn && role === "resident") destination = residentDestination(residentCompleteRef.current, destination, residentManagement(residentStateRef.current.request, residentStateRef.current.payment));
     setView(destination);
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   const loadMatches = async () => {
+    if (!residentCompleteRef.current) { navTo("residentAccount"); return; }
     if (paymentBlocking) {
       setMatchesError("Complete the payment for finished trial work before searching for another home helper.");
       navTo("requirement");
@@ -958,6 +992,7 @@ export default function Home() {
     }
   };
   const sendRequest = async () => {
+    if (!residentCompleteRef.current) { navTo("residentAccount"); return; }
     if (paymentBlocking) {
       setRequestError("Complete the payment for finished trial work before sending another booking request.");
       navTo("requirement");
@@ -1039,6 +1074,8 @@ export default function Home() {
       });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || "We could not withdraw the request.");
+      residentLoadRef.current += 1;
+      residentStateRef.current = { request: null, payment: residentStateRef.current.payment };
       setCurrentRequest(null);
       setBooking("draft");
       navTo("matches");
@@ -1069,23 +1106,29 @@ export default function Home() {
     }
   };
   const uploadAddressProof = async (file?: File) => {
-    if (!file) return;
+    if (file) proofRetryRef.current = { file, documentType: addressProofType };
+    const retry = proofRetryRef.current;
+    if (!retry) return;
+    setProofRetryAvailable(true);
+    setAddressProofUploaded(false);
     setProofUploading(true);
     setSetupError("");
     try {
       const form = new FormData();
-      form.append("file", file);
-      form.append("documentType", addressProofType);
+      form.append("file", retry.file);
+      form.append("documentType", retry.documentType);
       const response = await fetch("/api/helper/address-proof", { method: "POST", credentials: "same-origin", body: form });
       const result = await response.json() as { error?: string; filename?: string };
       if (!response.ok) throw new Error(result.error || "We could not upload the address proof.");
       setAddressProofUploaded(true);
-      setAddressProofName(result.filename || file.name);
+      setAddressProofName(result.filename || retry.file.name);
+      proofRetryRef.current = null;
+      setProofRetryAvailable(false);
+      if (proofInputRef.current) proofInputRef.current.value = "";
     } catch (error) {
       setSetupError(providerMessage(error, "We could not upload the address proof. Please try again."));
     } finally {
       setProofUploading(false);
-      if (proofInputRef.current) proofInputRef.current.value = "";
     }
   };
   const saveHelperProfile = async () => {
@@ -1123,6 +1166,7 @@ export default function Home() {
       });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || "We could not save your work profile.");
+      setSavedProfileStatus((result as { profileStatus?: string }).profileStatus || "draft");
       setSetupSubmitted(true);
     } catch (error) {
       setSetupError(providerMessage(error, "We could not save your work profile. Please try again."));
@@ -1156,6 +1200,10 @@ export default function Home() {
       });
       const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error || "We could not save your account.");
+      const saved = result as { profileComplete?: boolean; user?: { name?: string } };
+      residentCompleteRef.current = accountRole === "resident" && saved.profileComplete === true;
+      setResidentProfileReady(residentCompleteRef.current);
+      if (accountRole === "resident" && saved.user?.name) { setResidentName(saved.user.name); setSavedResidentName(saved.user.name); }
       navTo(accountRole === "resident" ? "requirement" : "setup");
     } catch (error) {
       setAuthError(providerMessage(error, "We could not save your account. Please try again."));
@@ -1164,6 +1212,9 @@ export default function Home() {
     }
   };
   const signOut = async () => {
+    residentLoadRef.current += 1;
+    residentNavigationRef.current += 1;
+    residentStateRef.current = { request: null, payment: null };
     setAccountMenuOpen(false);
     setAuthBusy(true);
     await fetch("/api/auth/signout", { method: "POST", credentials: "same-origin" }).catch(() => undefined);
@@ -1193,41 +1244,43 @@ export default function Home() {
     }
   };
   const handleBack = () => {
-    const previous: Record<string, string> = { mobile: "welcome", residentAccount: "mobile", helperAccount: "mobile", matches: "requirement", profile: "matches", review: "profile", pending: "review", confirmed: "pending", dashboard: "confirmed", membership: "dashboard", issue: "dashboard", settings: "dashboard", address: "settings", privacy: role === "provider" ? "providerSettings" : "settings", terms: legalReturnView, privacyPolicy: legalReturnView, signedOut: "settings", incoming: "setup", providerDashboard: "incoming", providerSettings: "providerDashboard", providerIssue: "providerDashboard" };
+    const previous: Record<string, string> = { mobile: "welcome", residentAccount: "mobile", helperAccount: "mobile", matches: "requirement", profile: "matches", review: "profile", pending: "review", confirmed: "pending", dashboard: "confirmed", issue: "dashboard", settings: "dashboard", address: "settings", privacy: role === "provider" ? "providerSettings" : "settings", terms: legalReturnView, privacyPolicy: legalReturnView, signedOut: "settings", incoming: "providerDashboard", helperSchedule: "providerDashboard", helperNotifications: "providerDashboard", providerDashboard: "incoming", providerSettings: "providerDashboard", providerIssue: "providerDashboard" };
     if (previous[view]) navTo(previous[view]);
   };
 
-  const displayName = role === "resident" ? residentName : helperName;
+  const displayName = role === "resident" ? savedResidentName : helperName;
   const accountDestination = role === "resident" ? "settings" : "providerSettings";
   const homeDestination = role === "resident" ? "dashboard" : "providerDashboard";
   const showBack = !["welcome", "requirement", "dashboard", "setup", "providerDashboard"].includes(view);
 
-  return <main>
+  const helperSchedule = <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div>{helperActiveBookings.length ? <><div className="job-list">{helperActiveBookings.map(item => <button className={item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><b>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</b><span><strong>{item.residentName}</strong><small>{item.residentAddress} · {item.bookingStatus === "trial" ? "paid trial" : "confirmed booking"}</small></span></button>)}</div>{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</> : <div className="empty-dashboard"><b>No bookings scheduled</b><p>Accepted bookings will appear here.</p></div>}</section>;
+  const notificationContent = <>
+            <div className="notification-panel-head"><div><h2>Notifications</h2><p>Booking updates in one place</p></div>{unreadCount > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div>
+            {alertPermission !== "granted" && <div className="browser-alert-card"><span aria-hidden>!</span><div><b>Don’t miss a booking update</b><small>{alertPermission === "denied" ? "Alerts are blocked in your browser settings." : alertPermission === "unsupported" ? "Browser alerts are not supported on this device." : "Allow booking alerts on this device."}</small></div>{alertPermission === "default" && <button onClick={() => void enableBrowserAlerts()}>Turn on</button>}</div>}
+            {notificationError && <p className="notification-error">{notificationError}</p>}
+            <div className="notification-list">{notifications.length ? notifications.map(item => <button key={item.id} className={item.readAt ? "" : "unread"} onClick={() => void openNotification(item)}><span className="notification-dot"/><span><b>{item.title}</b><small>{item.body}</small><em>{new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt.endsWith("Z") ? item.createdAt : `${item.createdAt.replace(" ", "T")}Z`))}</em></span><span aria-hidden>›</span></button>) : <div className="notification-empty"><span aria-hidden>✓</span><b>You’re all caught up</b><small>New requests and booking decisions will appear here.</small></div>}</div>
+</>;
+  return <main className={signedIn && role === "provider" ? "helper-shell" : undefined}>
     <header className="topbar">
       <button className="brand" onClick={() => navTo(signedIn ? homeDestination : "welcome")}><span className="brand-mark">N</span><span>Nivasa</span></button>
       {signedIn ? <div className="topbar-actions">
         <div className="notification-nav">
           {notificationOpen && <button className="account-menu-backdrop" aria-label="Close notifications" onClick={() => setNotificationOpen(false)}/>}
           <button className="notification-trigger" aria-label={unreadCount ? `${unreadCount} unread notifications` : "Notifications"} aria-expanded={notificationOpen} onClick={() => { setAccountMenuOpen(false); setNotificationOpen(open => !open); void loadNotifications(false); }}><svg aria-hidden viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg>{unreadCount > 0 && <b>{unreadCount > 9 ? "9+" : unreadCount}</b>}</button>
-          {notificationOpen && <section className="notification-panel" aria-label="Notifications">
-            <div className="notification-panel-head"><div><h2>Notifications</h2><p>Booking updates in one place</p></div>{unreadCount > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div>
-            {alertPermission !== "granted" && <div className="browser-alert-card"><span aria-hidden>!</span><div><b>Don’t miss a booking update</b><small>{alertPermission === "denied" ? "Alerts are blocked in your browser settings." : alertPermission === "unsupported" ? "Browser alerts are not supported on this device." : "Allow booking alerts on this device."}</small></div>{alertPermission === "default" && <button onClick={() => void enableBrowserAlerts()}>Turn on</button>}</div>}
-            {notificationError && <p className="notification-error">{notificationError}</p>}
-            <div className="notification-list">{notifications.length ? notifications.map(item => <button key={item.id} className={item.readAt ? "" : "unread"} onClick={() => void openNotification(item)}><span className="notification-dot"/><span><b>{item.title}</b><small>{item.body}</small><em>{new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }).format(new Date(item.createdAt.endsWith("Z") ? item.createdAt : `${item.createdAt.replace(" ", "T")}Z`))}</em></span><span aria-hidden>›</span></button>) : <div className="notification-empty"><span aria-hidden>✓</span><b>You’re all caught up</b><small>New requests and booking decisions will appear here.</small></div>}</div>
-          </section>}
+          {notificationOpen && <section className="notification-panel" aria-label="Notifications">{notificationContent}</section>}
         </div>
         <div className="account-nav">
         {accountMenuOpen && <button className="account-menu-backdrop" aria-label="Close account menu" onClick={() => setAccountMenuOpen(false)}/>}
-        <button className="account-trigger" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => { setNotificationOpen(false); setAccountMenuOpen(open => !open); }}><span className="account-avatar">{displayName.trim().charAt(0).toUpperCase() || "N"}</span><span className="account-trigger-copy"><b>{displayName}</b><small>{role === "resident" ? "Resident" : "Home helper"}</small></span><span className="account-caret">⌄</span></button>
+        <button className="account-trigger" aria-haspopup="menu" aria-expanded={accountMenuOpen} onClick={() => { setNotificationOpen(false); setAccountMenuOpen(open => !open); }}><span className="account-avatar">{avatarInitial(displayName)}</span><span className="account-trigger-copy"><b>{displayName}</b><small>{role === "resident" ? "Resident" : "Home helper"}</small></span><span className="account-caret">⌄</span></button>
         {accountMenuOpen && <div className="account-menu" role="menu"><div className="account-menu-summary"><b>{displayName}</b><small>+91 {mobile || "verified mobile"}</small></div><button role="menuitem" onClick={() => { setAccountMenuOpen(false); navTo(accountDestination); }}><span>Profile & settings</span><span>›</span></button><button className="signout-menu-item" role="menuitem" disabled={authBusy} onClick={signOut}><span>{authBusy ? "Signing out…" : "Sign out"}</span></button></div>}
         </div>
       </div> : null}
     </header>
+    {signedIn && role === "provider" && <HelperNavigation view={view} onNavigate={next => { setNotificationOpen(false); setAccountMenuOpen(false); navTo(next); if (next === "helperNotifications") void loadNotifications(false); if (next === "incoming" || next === "helperSchedule") void loadHelperRequests(false); }}/>}
     <div className="workspace app-workspace">
       <section className="phone-stage"><div className="phone-shell">
         {showBack && <div className="mobile-header"><button className="mobile-back" aria-label="Go back" onClick={handleBack}>← <span>Back</span></button></div>}
         {cancelOpen && <div className="sheet-backdrop" role="presentation" onClick={() => !cancelBusy && setCancelOpen(false)}><section className="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="cancel-title" onClick={event => event.stopPropagation()}><button className="sheet-close" aria-label="Close cancellation" disabled={cancelBusy} onClick={() => setCancelOpen(false)}>×</button><h2 id="cancel-title">Cancel this booking?</h2><p>The recurring time will be released immediately.</p>{activeRequest?.bookingStatus === "trial" && <div className="fee-card"><div><span>Payment for completed trial work</span><strong>{estimatedTrialPayment ? `₹${estimatedTrialPayment.toLocaleString("en-IN")}` : "₹0"}</strong></div><p>{estimatedTrialPayment ? `${completedTrialDays} completed service ${completedTrialDays === 1 ? "day remains" : "days remain"} payable directly to the home helper after cancellation.` : "No service day has been marked complete, so no trial payment is due."}</p></div>}<div className="cancel-reasons">{(role === "resident" ? ["Helper did not arrive", "Timing did not work", "Not satisfied with service", "Safety or misconduct", "Something else"] : ["Timing did not work", "Resident was unavailable", "Safety or misconduct", "Something else"]).map(item => <label key={item}><input type="radio" name="cancel-reason" checked={cancelReason === item} onChange={() => setCancelReason(item)}/><span>{item}</span></label>)}</div><Field label="Share feedback (optional)"><textarea rows={3} maxLength={1000} value={cancelFeedback} onChange={event => setCancelFeedback(event.target.value)} placeholder="Tell us what happened"/></Field>{cancelError && <p className="auth-error" role="alert">{cancelError}</p>}<button className="primary danger-button" disabled={!cancelReason || cancelBusy} onClick={() => void cancelBooking()}>{cancelBusy ? "Cancelling…" : "Cancel and release time"}</button><button className="secondary" disabled={cancelBusy} onClick={() => setCancelOpen(false)}>Keep booking</button></section></div>}
-        {paymentOpen && <div className="sheet-backdrop" role="presentation"><section className="bottom-sheet payment-sheet" role="dialog" aria-modal="true" aria-labelledby="payment-title"><button className="sheet-close" aria-label="Close payment" onClick={() => setPaymentOpen(false)}>×</button><Mark>Secure payment</Mark><h2 id="payment-title">Complete your slot membership</h2><p>You would now continue to the payment provider. The final amount, billing period and renewal consent will be shown before payment.</p><button className="primary" onClick={() => { setBooking("active"); setPaymentOpen(false); navTo("dashboard"); }}>Simulate successful payment</button><button className="secondary" onClick={() => setPaymentOpen(false)}>Return without paying</button></section></div>}
 
         {view === "welcome" && <div className="screen auth-screen welcome-screen">
           <div className="welcome-mark" aria-hidden><span>N</span></div>
@@ -1249,8 +1302,8 @@ export default function Home() {
 
         {view === "residentAccount" && <div className="screen auth-screen">
           <ScreenTitle eyebrow="Almost done" title="Set up your resident account" text="We need only the details required to match you with nearby home helpers." />
-          <Field label="Your name"><input className="text-input" autoComplete="name" value={residentName} onChange={event => setResidentName(event.target.value)} /></Field>
-          <Field label="House or flat number"><input className="text-input" autoComplete="address-line1" value={residentHouse} onChange={event => setResidentHouse(event.target.value)} placeholder="For example, House 214" /></Field>
+          <Field label="Your name"><input className="text-input" autoComplete="name" value={residentName} onChange={event => { residentDraftTouched.current = true; setResidentName(event.target.value); }} /></Field>
+          <Field label="House or flat number"><input className="text-input" autoComplete="address-line1" value={residentHouse} onChange={event => { residentDraftTouched.current = true; setResidentHouse(event.target.value); }} placeholder="For example, House 214" /></Field>
           <Field label="Search for your society or address" hint="Choose a result from Google so we can calculate nearby matches."><GoogleAddressField value={residentAddress?.formattedAddress || ""} onSelect={setResidentAddress} onClear={() => setResidentAddress(null)} placeholder="Start typing your society or address" /></Field>
           <div className="privacy-note"><b>Your address stays private</b><p>Before booking, home helpers see only your approximate locality. Your full address is shared only after acceptance.</p></div>
           <label className="consent account-consent"><input type="checkbox" checked={termsAccepted} onChange={event => setTermsAccepted(event.target.checked)} /><span>I agree to Nivasa’s <button type="button" onClick={() => openLegalPage("terms")}>Terms</button> and <button type="button" onClick={() => openLegalPage("privacyPolicy")}>Privacy Policy</button>.</span></label>
@@ -1269,8 +1322,9 @@ export default function Home() {
 
         {view === "requirement" && <div className="screen">
           <ScreenTitle title="Find reliable house help nearby" text="Tell us the work and timing. We’ll show people who can fit it into their regular schedule." />
-          {trialPayment && <section className="payment-action-card"><Mark>{trialPayment.status === "pending" ? "Payment due" : trialPayment.status === "resident_marked_paid" ? "Awaiting confirmation" : "Review requested"}</Mark><h2>₹{trialPayment.amountRupees.toLocaleString("en-IN")} for completed trial work</h2>{trialPayment.status === "pending" ? <><p>Pay {trialPayment.helperName || "your home helper"} directly. You cannot send another booking request until you mark this payment as sent.</p>{paymentMobile ? <><SummaryRow label="Pay using mobile number" value={`+91 ${paymentMobile}`}/><p className="payment-note">Open your preferred UPI app and pay using this registered mobile number.</p></> : <p className="payment-note">Use the payment method agreed with the home helper.</p>}<button className="primary" disabled={paymentBusy} onClick={() => void updateTrialPayment("mark_paid")}>{paymentBusy ? "Saving…" : "I have paid"}</button></> : trialPayment.status === "resident_marked_paid" ? <><p>{trialPayment.helperName || "Your home helper"} has been asked to confirm receipt after checking her payment app.</p>{canRequestPaymentReview ? <button className="secondary" disabled={paymentBusy} onClick={() => void updateTrialPayment("request_review")}>Payment sent but not confirmed</button> : <small>You can request a backend review 12 hours after marking the payment as sent.</small>}</> : <p>Your payment is queued for backend review. You can now send a new booking request.</p>}{paymentError && <p className="auth-error" role="alert">{paymentError}</p>}</section>}
-          <Field label="What services do you need?"><div className="service-cards">{["House cleaning", "Utensil cleaning", "House cleaning + utensils"].map(item => <button key={item} onClick={() => { setService(item); if (item === "House cleaning") setFrequency("Once daily"); }} className={service === item ? "selected" : ""}><span className="service-icon">{item === "House cleaning" ? "⌂" : item === "Utensil cleaning" ? "◒" : "✦"}</span><span>{item}</span>{service === item && <Check />}</button>)}</div></Field>
+          {trialPayment && <section className="payment-action-card"><Mark>{trialPayment.status === "pending" ? "Payment due" : trialPayment.status === "resident_marked_paid" ? "Awaiting confirmation" : "Review requested"}</Mark><h2>₹{trialPayment.amountRupees.toLocaleString("en-IN")} for completed trial work</h2>{trialPayment.status === "pending" ? <><p>Pay {trialPayment.helperName || "your home helper"} directly. You cannot send another booking request until you mark this payment as sent.</p>{paymentMobile ? <><SummaryRow label="Pay using mobile number" value={`+91 ${paymentMobile}`}/><p className="payment-note">Open your preferred UPI app and pay using this registered mobile number.</p></> : <p className="payment-note">Use the payment method agreed with the home helper.</p>}<button className="primary" disabled={paymentBusy} onClick={() => void updateTrialPayment("mark_paid")}>{paymentBusy ? "Saving…" : "I have paid"}</button></> : trialPayment.status === "resident_marked_paid" ? <><p>{trialPayment.helperName || "Your home helper"} has been asked to confirm receipt after checking her payment app.</p>{canRequestPaymentReview ? <button className="secondary" disabled={paymentBusy} onClick={() => void updateTrialPayment("request_review")}>Payment sent but not confirmed</button> : <small>You can request a backend review 12 hours after marking the payment as sent.</small>}</> : <p>Your payment is queued for backend review.{residentProfileReady ? " You can now send a new booking request." : " Complete your profile before starting new work."}</p>}{paymentError && <p className="auth-error" role="alert">{paymentError}</p>}</section>}
+          {!residentProfileReady && trialPayment && currentRequest?.bookingId && <button className="secondary" onClick={openIssueReport}>Report an issue with this booking</button>}
+          {residentProfileReady ? <><Field label="What services do you need?"><div className="service-cards">{["House cleaning", "Utensil cleaning", "House cleaning + utensils"].map(item => <button key={item} onClick={() => { setService(item); if (item === "House cleaning") setFrequency("Once daily"); }} className={service === item ? "selected" : ""}><span className="service-icon">{item === "House cleaning" ? "⌂" : item === "Utensil cleaning" ? "◒" : "✦"}</span><span>{item}</span>{service === item && <Check />}</button>)}</div></Field>
           {service !== "House cleaning" && <Field label="How often should utensils be cleaned?"><Segmented label="Utensil frequency" options={["Once daily", "Twice daily"]} value={frequency} onChange={setFrequency} /></Field>}
           {service.includes("House cleaning") && <Field label="Home size"><Segmented label="Home size" options={["1–2 BHK", "3 BHK", "4+ BHK"]} value={homeSize} onChange={setHomeSize} /></Field>}
           <div className={twice ? "time-grid" : ""}><Field label={twice ? "First visit time" : "Preferred time"}><input className="time-input" type="time" value={firstTime} onChange={event => setFirstTime(event.target.value)} /></Field>{twice && <Field label="Second visit time"><input className="time-input" type="time" value={secondTime} min={firstTime} onChange={event => setSecondTime(event.target.value)} /></Field>}</div>{invalidTimes && <p className="field-error">Choose a second visit time after the first visit.</p>}
@@ -1279,7 +1333,7 @@ export default function Home() {
           <Field label="When should the service start?"><input className="text-input" type="date" min={new Date().toISOString().slice(0, 10)} value={requestedStartDate} onChange={event => setRequestedStartDate(event.target.value)} /></Field>
           <Field label="Your home"><button className="input-like" onClick={() => navTo("address")}><span>⌖</span><span>{residentAddress ? `${residentHouse}, ${residentAddress.locality}` : "Add your home address"}<small>Exact address stays private until booking</small></span><span>›</span></button></Field>
           {matchesError && <p className="auth-error" role="alert">{matchesError}</p>}
-          <button className="primary" disabled={invalidTimes || matchesLoading || paymentBlocking} onClick={() => void loadMatches()}>{paymentBlocking ? "Complete trial payment to search" : matchesLoading ? "Finding available helpers…" : "Find available home helpers"} {!paymentBlocking && <span>→</span>}</button>
+          <button className="primary" disabled={invalidTimes || matchesLoading || paymentBlocking} onClick={() => void loadMatches()}>{paymentBlocking ? "Complete trial payment to search" : matchesLoading ? "Finding available helpers…" : "Find available home helpers"} {!paymentBlocking && <span>→</span>}</button></> : <button className="secondary" onClick={() => navTo("residentAccount")}>Complete your profile before finding new help</button>}
         </div>}
 
         {view === "matches" && <div className="screen">
@@ -1307,7 +1361,7 @@ export default function Home() {
           {selectedPerson && <div className="mini-person"><Avatar person={selectedPerson} small/><span><b>{selectedPerson.name}</b><small>{selectedPerson.addressProofProvided ? <><Check /> Address proof provided</> : "Profile information provided"} · {selectedPerson.distance.toFixed(1)} km away</small></span></div>}
           <section className="review-section"><h2>Service</h2><SummaryRow label="Package" value={packageName}/>{service.includes("House cleaning") && <SummaryRow label="Home size" value={homeSize}/>}<SummaryRow label={twice ? "First visit" : "Schedule"} value={twice ? `${formatTime(matchedFirstTime)}${service.startsWith("House") && cleaningVisit === "First visit" ? " · includes house cleaning" : " · utensils"}` : `Mon–Sat · ${formatTime(matchedFirstTime)}`}/>{twice && <SummaryRow label="Second visit" value={`${formatTime(matchedSecondTime)}${service.startsWith("House") && cleaningVisit === "Second visit" ? " · includes house cleaning" : " · utensils"}`}/>}<SummaryRow label="Starts" value={friendlyDate(requestedStartDate)}/><SummaryRow label={`${chosenHelperName}’s monthly price`} value={`₹${monthlyPrice.toLocaleString("en-IN")}`} strong/></section>
           <section className="review-section"><h2>How the booking works</h2><div className="timeline"><span/><div><b>Request sent</b><p>{chosenHelperName} gets 24 hours to respond.</p></div><span/><div><b>Booking confirmed on acceptance</b><p>Your recurring {twice ? "times are" : "time is"} reserved immediately.</p></div><span/><div><b>Two-day paid trial</b><p>You can cancel during the first two service days; completed work remains payable.</p></div></div></section>
-          <section className="fee-card"><div><span>Platform slot membership</span><Mark>No platform fee during beta</Mark></div><p>During the beta, {twice ? "both recurring time slots are" : "your recurring time slot is"} reserved without a platform charge. After the beta, you will see the complete membership offer and choose whether to continue before any payment is requested.</p></section>
+          <section className="fee-card"><div><span>Platform slot membership</span><Mark>No platform fee during beta</Mark></div><p>During the beta, your first two service days are paid trials. Membership allows you to keep this slot reserved. During the beta, membership is free. After the beta, we’ll share the membership charges.</p></section>
           {requestError && <p className="auth-error" role="alert">{requestError}</p>}<button className="primary" disabled={requestBusy || !selectedPerson} onClick={() => void sendRequest()}>{requestBusy ? "Holding this time…" : "Send booking request"} <span>→</span></button><p className="consent-copy">By continuing, you agree to the service scope, listed price and booking terms.</p>
         </div>}
 
@@ -1326,19 +1380,20 @@ export default function Home() {
         {view === "dashboard" && <div className="screen dashboard-screen">
           <ScreenTitle title="Your home help" />
           {currentRequest?.bookingId && currentRequest.bookingStatus !== "cancelled" ? <section className="active-booking"><div className="booking-person"><span className="avatar clay small">{currentRequest.helperName?.trim().charAt(0).toUpperCase() || "H"}</span><span><b>{currentRequest.helperName}</b><small>{storedPackageName(currentRequest)} · Mon–Sat</small></span></div><div className="next-visit"><span><b>{currentRequest.bookingStatus === "trial" ? "Paid trial" : "Current service period"}</b><small>{currentRequest.bookingStatus === "trial" ? `${Number(currentRequest.trialVisitsCompleted ?? 0)} of 2 service days completed` : `Runs through ${friendlyDate(currentRequest.cycleEndsAt)}`}</small></span><strong>{residentBookingSchedule}</strong></div><div className="contact-actions">{currentRequest.helperMobile ? <a href={`tel:${currentRequest.helperMobile}`}>☎ Call {currentRequest.helperName}</a> : <button disabled>Contact unavailable</button>}</div></section> : <div className="empty-dashboard"><b>No confirmed booking</b><p>Find an available home helper to begin.</p><button className="secondary" onClick={() => navTo("requirement")}>Find home help</button></div>}
-          <section className="dashboard-block"><div className="section-head"><h2>Booking details</h2></div><div className="dashboard-list"><div className="dashboard-info"><span className="list-icon">◷</span><span><b>Recurring schedule</b><small>{residentBookingSchedule}</small></span></div><button onClick={() => navTo("membership")}><span className="list-icon">₹</span><span><b>Membership</b><small>{booking === "ending" ? `Renewal off · ends ${friendlyDate(currentRequest?.cycleEndsAt)}` : "Slot protected during beta"}</small></span><span>›</span></button><div className="dashboard-info"><span className="list-icon">▤</span><span><b>Monthly compensation</b><small>₹{monthlyPrice.toLocaleString("en-IN")} due after the first 30-day cycle</small></span></div></div></section>
+          <section className="dashboard-block"><div className="section-head"><h2>Booking details</h2></div><div className="dashboard-list"><div className="dashboard-info"><span className="list-icon">◷</span><span><b>Recurring schedule</b><small>{residentBookingSchedule}</small></span></div><div className="dashboard-info"><span className="list-icon">▤</span><span><b>Monthly compensation</b><small>₹{monthlyPrice.toLocaleString("en-IN")} due after the first 30-day cycle</small></span></div></div></section>
           <section className="dashboard-block"><div className="section-head"><h2>Manage</h2></div><div className="dashboard-list"><button onClick={openIssueReport}><span className="list-icon">!</span><span><b>Report an issue</b><small>No-show, payment, safety or service concern</small></span><span>›</span></button>{canCancelBooking ? <button onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}><span className="list-icon">×</span><span><b>Cancel booking</b><small>Release this recurring time immediately</small></span><span>›</span></button> : <div className="dashboard-info"><span className="list-icon">⌁</span><span><b>Cancellation unavailable</b><small>Available again after {friendlyDate(currentRequest?.cycleEndsAt)}</small></span></div>}</div></section>
         </div>}
 
-        {view === "membership" && <div className="screen"><ScreenTitle eyebrow="Keep your recurring slot" title="Your booking" text={`Membership keeps ${chosenHelperName}’s recurring time reserved for you.`} />{betaMode ? <section className="beta-membership"><Mark>Beta access</Mark><h2>Your slot is reserved during the beta</h2><p>No platform payment is required. After the beta, you can review the complete membership offer and choose whether to continue.</p></section> : <section className="membership-price"><span>30-day membership</span><b>Final price shown here</b><p>Separate from your home helper’s monthly compensation.</p></section>}<section className="benefits"><h2>Included</h2><p><Check /> Recurring slot protection</p><p><Check /> Rematch support without extra cost</p><p><Check /> Verified booking and review history</p><p><Check /> Issue reporting</p></section><button className="primary" onClick={() => betaMode ? navTo("dashboard") : setPaymentOpen(true)}>{betaMode ? "Return to booking" : "Continue to secure payment"}</button>{canCancelBooking && <button className="secondary" onClick={() => setCancelOpen(true)}>Cancel booking</button>}<p className="consent-copy">Completed service remains payable even if you cancel.</p></div>}
 
         {view === "issue" && <div className="screen">{!issueSent ? <><ScreenTitle eyebrow="We’re here to help" title="What happened?" text="Choose the closest option. Safety concerns are reviewed urgently." /><div className="issue-options">{["Helper did not arrive", "Timing did not work", "Not satisfied with service", "Safety or misconduct", "Something else"].map(item => <label key={item}><input type="radio" name="issue" checked={residentIssue === item} onChange={() => setResidentIssue(item)}/><span>{item}</span></label>)}</div><Field label="Share feedback (optional)"><textarea value={residentIssueFeedback} onChange={event => setResidentIssueFeedback(event.target.value)} maxLength={1000} placeholder="Add a short description. Please don’t include Aadhaar or other identity numbers." rows={4}/></Field>{issueError && <p className="auth-error" role="alert">{issueError}</p>}<button className="primary" disabled={!residentIssue || issueBusy} onClick={() => void submitIssue()}>{issueBusy ? "Submitting…" : "Submit report"}</button></> : <div className="state-screen"><div className="state-illustration confirmed-art"><span>✓</span></div><Mark>Report received</Mark><ScreenTitle title={issueCaseNumber ? `Case #${issueCaseNumber} has been created` : "Your report has been saved"} text="We’ll review your report and contact you on your registered mobile number if we need more information."/><button className="primary" onClick={() => navTo("dashboard")}>Return to dashboard</button></div>}</div>}
 
         {view === "settings" && <div className="screen"><ScreenTitle eyebrow="Account" title="Profile & settings"/><div className="profile-summary"><span className="avatar violet">S</span><div><b>{residentName}</b><small><Check/> Mobile verified</small></div></div><div className="dashboard-list standalone"><button onClick={() => navTo("address")}><span className="list-icon">⌂</span><span><b>Home address</b><small>Saved privately for matching</small></span><span>›</span></button><button><span className="list-icon">◉</span><span><b>Mobile</b><small>+91 {mobile || "98XXX XXXXX"}</small></span><span>›</span></button><button onClick={() => navTo("privacy")}><span className="list-icon">⌾</span><span><b>Privacy & data</b><small>See and manage your information</small></span><span>›</span></button></div><button className="secondary" onClick={signOut}>Sign out</button></div>}
 
-        {view === "providerSettings" && <div className="screen"><ScreenTitle eyebrow="Account" title="Profile & settings"/><div className="profile-summary"><span className="avatar sage">{helperName.trim().charAt(0).toUpperCase() || "H"}</span><div><b>{helperName}</b><small><Check/> Mobile verified</small></div></div><div className="dashboard-list standalone"><button onClick={() => navTo("setup")}><span className="list-icon">✦</span><span><b>Work profile</b><small>Services, prices, work area and available times</small></span><span>›</span></button><div className="dashboard-info"><span className="list-icon">◉</span><span><b>Mobile</b><small>+91 {mobile || "98XXX XXXXX"}</small></span></div><button onClick={() => navTo("privacy")}><span className="list-icon">⌾</span><span><b>Privacy & data</b><small>See and manage your information</small></span><span>›</span></button></div><button className="secondary" disabled={authBusy} onClick={signOut}>{authBusy ? "Signing out…" : "Sign out"}</button></div>}
+        {view === "helperSchedule" && <div className="screen"><ScreenTitle title="Schedule"/>{helperSchedule}</div>}
+        {view === "helperNotifications" && <div className="screen">{notificationContent}</div>}
+        {view === "providerSettings" && <div className="screen"><ScreenTitle eyebrow="Account" title="Profile & settings"/><div className="profile-summary"><span className="avatar sage">{helperName.trim().charAt(0).toUpperCase() || "H"}</span><div><b>{helperName}</b><small><Check/> Mobile verified</small></div></div><div className="dashboard-list standalone"><button onClick={() => navTo("setup")}><span className="list-icon">✦</span><span><b>Work profile</b><small>Services, prices, work area and available times</small></span><span>›</span></button><button onClick={openIssueReport}><span className="list-icon">?</span><span><b>Help &amp; support</b><small>Report a booking problem</small></span><span>›</span></button><div className="dashboard-info"><span className="list-icon">◉</span><span><b>Mobile</b><small>+91 {mobile || "98XXX XXXXX"}</small></span></div><button onClick={() => navTo("privacy")}><span className="list-icon">⌾</span><span><b>Privacy & data</b><small>See and manage your information</small></span><span>›</span></button></div><button className="secondary" disabled={authBusy} onClick={signOut}>{authBusy ? "Signing out…" : "Sign out"}</button></div>}
 
-        {view === "address" && <div className="screen"><ScreenTitle eyebrow="Private information" title="Edit home address" text="Your exact address is used for nearby matching and shared with your home helper only after a booking is confirmed."/><Field label="House or flat number"><input className="text-input" value={residentHouse} onChange={event => setResidentHouse(event.target.value)} placeholder="For example, House 214"/></Field><Field label="Search for your society or address" hint="Choose a result from Google so we can calculate nearby matches."><GoogleAddressField value={residentAddress?.formattedAddress || ""} onSelect={setResidentAddress} onClear={() => setResidentAddress(null)} placeholder="Start typing your society or address"/></Field>{booking !== "draft" && <div className="info-banner"><span>i</span><p>Changing your address may affect {chosenHelperName}’s distance and availability. We’ll recheck the current booking before applying the change.</p></div>}{authError && <p className="auth-error" role="alert">{authError}</p>}<button className="primary" disabled={addressSaving} onClick={() => void saveResidentAddress()}>{addressSaving ? "Saving…" : "Save address"}</button></div>}
+        {view === "address" && <div className="screen"><ScreenTitle eyebrow="Private information" title="Edit home address" text="Your exact address is used for nearby matching and shared with your home helper only after a booking is confirmed."/><Field label="House or flat number"><input className="text-input" value={residentHouse} onChange={event => { residentDraftTouched.current = true; setResidentHouse(event.target.value); }} placeholder="For example, House 214"/></Field><Field label="Search for your society or address" hint="Choose a result from Google so we can calculate nearby matches."><GoogleAddressField value={residentAddress?.formattedAddress || ""} onSelect={setResidentAddress} onClear={() => setResidentAddress(null)} placeholder="Start typing your society or address"/></Field>{booking !== "draft" && <div className="info-banner"><span>i</span><p>Changing your address may affect {chosenHelperName}’s distance and availability. We’ll recheck the current booking before applying the change.</p></div>}{authError && <p className="auth-error" role="alert">{authError}</p>}<button className="primary" disabled={addressSaving} onClick={() => void saveResidentAddress()}>{addressSaving ? "Saving…" : "Save address"}</button></div>}
 
         {view === "privacy" && <div className="screen"><ScreenTitle eyebrow="Your information" title="Privacy & data" text="A simple view of what Nivasa collects and shares."/><section className="privacy-section"><h2>Information we collect</h2><p>Name and mobile number, saved home address, requests and bookings, payments, reviews, complaints and product usage.</p></section><section className="privacy-section"><h2>What is shared</h2><p>Only an approximate locality is shown before acceptance. Your exact address and contact are shared with your selected home helper after booking confirmation. Private verification documents are never publicly displayed.</p></section><section className="privacy-section"><h2>Read our policies</h2><p>See how Nivasa operates the pilot and handles your information.</p><button className="secondary" onClick={() => openLegalPage("privacyPolicy")}>Privacy Policy</button><button className="secondary" onClick={() => openLegalPage("terms")}>Terms of Use</button></section><section className="privacy-section"><h2>Need help?</h2><p>Submit a private backend case and choose “Something else” for an account or privacy question.</p><button className="secondary" onClick={openIssueReport}>Report an issue</button></section></div>}
 
@@ -1348,12 +1403,11 @@ export default function Home() {
 
         {view === "signedOut" && <div className="screen state-screen"><div className="state-illustration pending-art"><span>⌁</span></div><ScreenTitle title="You’re signed out" text="Use your registered mobile number and OTP to access your account again."/><button className="primary" onClick={() => navTo("welcome")}>Sign in with mobile OTP</button></div>}
 
-        {view === "setup" && <div className="screen provider-form">{setupSubmitted ? <div className="state-screen"><div className="state-illustration confirmed-art"><span>✓</span></div><Mark>Profile live</Mark><ScreenTitle title="Residents can now find you" text="Your services, prices and available times have been saved. Your address proof is stored privately and marked as provided."/><button className="primary" onClick={() => navTo("providerDashboard")}>Go to your dashboard</button><button className="secondary" onClick={() => setSetupSubmitted(false)}>Edit work profile</button></div> : setupLoading ? <div className="state-screen"><ScreenTitle title="Loading your work profile" text="Your saved services and available times will appear here."/></div> : <>
+        {view === "setup" && <div className="screen provider-form">{setupSubmitted ? <div className="state-screen"><div className="state-illustration confirmed-art"><span>✓</span></div><Mark>Profile saved</Mark><ScreenTitle title={savedProfileStatus === "active" ? "Residents can now find you" : "Your profile status is unchanged"} text="Your services, prices and available times have been saved. Your address proof is stored privately and marked as provided."/><button className="primary" onClick={() => navTo("providerDashboard")}>Go to your dashboard</button><button className="secondary" onClick={() => setSetupSubmitted(false)}>Edit work profile</button></div> : setupLoading ? <div className="state-screen"><ScreenTitle title="Loading your work profile" text="Your saved services and available times will appear here."/></div> : <>
           <ScreenTitle eyebrow={`Welcome, ${helperName || "home helper"}`} title="Set up your work profile" text="Add your work area, services, prices and free times. You can return and edit them later."/>
-          <section className="form-section"><h2>Payment details</h2><p className="form-guidance">Residents will use your verified mobile number to pay you directly through their preferred UPI app.</p><small>You receive trial and monthly compensation directly. Nivasa does not deduct it during the beta.</small></section>
           <section className="form-section"><h2>1. Where you can work</h2><Field label="Where do you usually start work from?" hint="Choose your address from Google suggestions."><GoogleAddressField value={helperAddress?.formattedAddress || ""} onSelect={address => { setHelperAddress(address); setHelperLocality(address.locality); }} onClear={() => { setHelperAddress(null); setHelperLocality(""); }} placeholder="Start typing your home or starting address" /></Field><Field label="Approximately how far are you willing to travel?" hint="Enter a rough estimate. This helps rank suitable work; it is not a strict promise."><div className="distance-input"><input className="text-input" type="number" inputMode="decimal" min="0.1" step="0.5" value={helperTravelDistance} onChange={event => setHelperTravelDistance(event.target.value)} placeholder="For example, 8"/><span>km</span></div></Field><small>Your exact address stays private. Residents will see only an approximate distance when matching.</small></section>
-          <section className="form-section"><div className="inline-heading"><div><h2>2. Address proof</h2><p>Aadhaar, voter ID or another government-issued address proof</p></div></div><Field label="Document type"><select className="text-input" value={addressProofType} onChange={event => setAddressProofType(event.target.value)}><option value="aadhaar">Aadhaar</option><option value="voter_id">Voter ID</option><option value="other_address_proof">Other address proof</option></select></Field><input ref={proofInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,application/pdf" onChange={event => void uploadAddressProof(event.target.files?.[0])}/><button className="secondary upload-proof" disabled={proofUploading} onClick={() => proofInputRef.current?.click()}>{proofUploading ? "Uploading securely…" : addressProofUploaded ? "Replace address proof" : "Upload address proof"}</button>{addressProofUploaded && <div className="document-status"><Check/><span><b>Address proof provided</b><small>{addressProofName}</small></span></div>}<small>JPG, PNG or PDF · maximum 5 MB. The document is private and is never shown to residents.</small></section>
-          <section className="form-section"><h2>3. Services and monthly prices</h2><Field label="Years of experience"><input className="text-input" type="number" min="0" max="60" value={yearsExperience} onChange={event => setYearsExperience(event.target.value)} placeholder="Enter years"/></Field><div className="service-price-block"><label className="toggle-row"><span><b>House cleaning</b><small>Sweeping, mopping, kitchen and bathroom surfaces; flush cleaning is not included</small></span><input type="checkbox" checked={houseCleaningEnabled} onChange={event => setHouseCleaningEnabled(event.target.checked)}/></label>{houseCleaningEnabled && <div className="price-inputs"><Field label="1–2 BHK"><input className="text-input" inputMode="numeric" value={housePrices.oneTwo} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, oneTwo:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="3 BHK"><input className="text-input" inputMode="numeric" value={housePrices.three} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, three:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="4+ BHK"><input className="text-input" inputMode="numeric" value={housePrices.fourPlus} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, fourPlus:event.target.value.replace(/\D/g, "")}))}/></Field></div>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · once daily</b></span><input type="checkbox" checked={utensilsOnceEnabled} onChange={event => setUtensilsOnceEnabled(event.target.checked)}/></label>{utensilsOnceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsOncePrice} placeholder="₹ monthly" onChange={event => setUtensilsOncePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · twice daily</b></span><input type="checkbox" checked={utensilsTwiceEnabled} onChange={event => setUtensilsTwiceEnabled(event.target.checked)}/></label>{utensilsTwiceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsTwicePrice} placeholder="₹ monthly" onChange={event => setUtensilsTwicePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div><small>Residents will see one total price calculated for the exact package they request.</small></section>
+          <section className="form-section"><div className="inline-heading"><div><h2>2. Address proof</h2><p>Aadhaar, voter ID or another government-issued address proof</p></div></div><Field label="Document type"><select className="text-input" value={addressProofType} disabled={proofUploading} onChange={event => { setAddressProofType(event.target.value); proofRetryRef.current = null; setProofRetryAvailable(false); if (proofInputRef.current) proofInputRef.current.value = ""; }}><option value="aadhaar">Aadhaar</option><option value="voter_id">Voter ID</option><option value="other_address_proof">Other address proof</option></select></Field><input ref={proofInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,application/pdf" onChange={event => void uploadAddressProof(event.target.files?.[0])}/><button className="secondary upload-proof" disabled={proofUploading} onClick={() => proofInputRef.current?.click()}>{proofUploading ? "Uploading securely…" : addressProofUploaded ? "Replace address proof" : "Upload address proof"}</button>{proofRetryAvailable && !proofUploading && <button className="secondary" onClick={() => void uploadAddressProof()}>Retry selected address proof</button>}{addressProofUploaded && <div className="document-status"><Check/><span><b>Address proof provided</b><small>{addressProofName}</small></span></div>}<small>JPG, PNG or PDF · maximum 5 MB. The document is private and is never shown to residents.</small></section>
+          <section className="form-section"><h2>3. Services and monthly prices</h2><Field label="Years of experience"><input className="text-input" type="number" min="0" max="60" value={yearsExperience} onChange={event => setYearsExperience(event.target.value)} placeholder="Enter years"/></Field><div className="service-price-block"><label className="toggle-row"><span><b>House cleaning</b><small>Sweeping, mopping, kitchen and bathroom surfaces; flush cleaning is not included</small></span><input type="checkbox" checked={houseCleaningEnabled} onChange={event => setHouseCleaningEnabled(event.target.checked)}/></label>{houseCleaningEnabled && <div className="price-inputs"><Field label="1–2 BHK"><input className="text-input" inputMode="numeric" value={housePrices.oneTwo} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, oneTwo:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="3 BHK"><input className="text-input" inputMode="numeric" value={housePrices.three} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, three:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="4+ BHK"><input className="text-input" inputMode="numeric" value={housePrices.fourPlus} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, fourPlus:event.target.value.replace(/\D/g, "")}))}/></Field></div>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · once daily</b></span><input type="checkbox" checked={utensilsOnceEnabled} onChange={event => setUtensilsOnceEnabled(event.target.checked)}/></label>{utensilsOnceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsOncePrice} placeholder="₹ monthly" onChange={event => setUtensilsOncePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · twice daily</b></span><input type="checkbox" checked={utensilsTwiceEnabled} onChange={event => setUtensilsTwiceEnabled(event.target.checked)}/></label>{utensilsTwiceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsTwicePrice} placeholder="₹ monthly" onChange={event => setUtensilsTwicePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div></section>
           <section className="form-section"><h2>4. Available recurring times</h2><p className="section-copy">Add every regular time during which residents may book you.</p><div className="availability-slots">{availabilitySlots.map((slot, index) => <div className="availability-slot" key={slot.id}><Field label="Days"><select className="text-input" value={slot.days} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, days:event.target.value} : item))}><option value="mon_sat">Monday–Saturday</option><option value="mon_fri">Monday–Friday</option><option value="every_day">Every day</option></select></Field><div className="time-grid"><Field label="From"><input className="time-input" type="time" value={slot.start} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, start:event.target.value} : item))}/></Field><Field label="Until"><input className="time-input" type="time" value={slot.end} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, end:event.target.value} : item))}/></Field></div>{availabilitySlots.length > 1 && <button className="text-button danger" onClick={() => setAvailabilitySlots(current => current.filter(item => item.id !== slot.id))}>Remove this time</button>}</div>)}</div><button className="secondary add-slot" onClick={() => setAvailabilitySlots(current => [...current, {id:crypto.randomUUID(), days:"mon_sat", start:"18:00", end:"20:00"}])}>+ Add another available time</button><small>A 15-minute travel buffer is enforced automatically between bookings.</small></section>
           <section className="privacy-note"><b>Your privacy matters</b><p>Residents never see your proof document, exact home address or phone number before an accepted booking.</p></section>{setupError && <p className="auth-error" role="alert">{setupError}</p>}<button className="primary" disabled={setupSaving || proofUploading} onClick={() => void saveHelperProfile()}>{setupSaving ? "Saving profile…" : "Save and publish profile"}</button>
         </>}</div>}
@@ -1361,15 +1415,15 @@ export default function Home() {
         {view === "incoming" && <div className="screen">{helperRequest ? <><ScreenTitle eyebrow="New booking request" title={`${helperRequest.residentName || "A resident"} needs ${storedPackageName(helperRequest).toLowerCase()}`}/><section className="response-deadline"><span>◷</span><div><small>Response needed within 24 hours</small><b>Respond by {new Date(helperRequest.responseDueAt).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}</b><p>Your {helperRequest.slots.map(slot => formatTime(slot.startTime)).join(" and ")} recurring {helperRequest.slots.length > 1 ? "times are" : "time is"} held until then.</p><strong>Respond before the hold expires</strong></div></section><div className="resident-chip"><span className="avatar violet small">{helperRequest.residentName?.trim().charAt(0).toUpperCase() || "R"}</span><span><b>{helperRequest.residentName || "Resident"}</b><small><Check/> Mobile verified · {helperRequest.residentLocality}</small></span></div><section className="request-details"><SummaryRow label="Service" value={storedPackageName(helperRequest)}/><SummaryRow label="Your listed price" value={`₹${helperRequest.monthlyPriceRupees.toLocaleString("en-IN")}/month`} strong/><SummaryRow label="Schedule" value={helperRequest.slots.map(slot => formatTime(slot.startTime)).join(" & ")}/><SummaryRow label="Starts" value={friendlyDate(helperRequest.requestedStartDate)}/><SummaryRow label="Location" value={helperRequest.residentLocality || "Shared after acceptance"}/></section><div className="info-banner"><span>i</span><p>Accepting confirms the booking immediately. The first two service days are a paid trial.</p></div>{requestError && <p className="auth-error" role="alert">{requestError}</p>}<button className="primary" disabled={requestBusy} onClick={() => void respondToRequest("accept")}>{requestBusy ? "Confirming…" : "Accept booking"}</button><button className="secondary" disabled={requestBusy} onClick={() => void respondToRequest("decline")}>Not available</button><p className="consent-copy">The resident’s exact address and contact are shared only after acceptance.</p></> : <div className="empty-dashboard"><b>No active booking request</b><p>The request may have been withdrawn or its 24-hour hold may have ended.</p><button className="secondary" onClick={() => { void loadHelperRequests(false); navTo("providerDashboard"); }}>Return to your work</button></div>}</div>}
 
         {view === "providerDashboard" && <div className="screen dashboard-screen">
-          <ScreenTitle title="Your work"/>
-          <div className="provider-stats"><span><b>{helperActiveBookings.length}</b><small>Bookings</small></span><span><b>{helperRequest ? 1 : 0}</b><small>Next request</small></span><span><b>{availabilitySlots.filter(slot => slot.start && slot.end).length}</b><small>Available times</small></span></div>
+          <ScreenTitle title="Helper dashboard"/>
+          <div className="provider-stats"><span><b>{helperActiveBookings.length}</b><small>Bookings</small></span><span><b>{helperRequest ? 1 : 0}</b><small>Next request</small></span></div>
           {helperRequest && <section className="success-banner"><span>◷</span><span><b>New request from {helperRequest.residentName}</b><small>Respond before {new Date(helperRequest.responseDueAt).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" })}</small></span><button className="text-button" onClick={() => navTo("incoming")}>Review</button></section>}
           {helperActiveBooking && <section className="success-banner"><Check/><span><b>{helperActiveBookings.length === 1 ? `Booking confirmed with ${helperActiveBooking.residentName}` : `${helperActiveBookings.length} confirmed bookings`}</b><small>Selected: {helperActiveBooking.residentName} · {helperActiveBooking.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</small></span></section>}
           {helperActiveBooking?.bookingStatus === "trial" && <section className="trial-progress-card"><div className="section-head"><h2>Paid trial</h2><Mark>{Number(helperActiveBooking.trialVisitsCompleted ?? 0)} of 2 complete</Mark></div>{helperActiveBooking.trialDays?.map(day => { const isFuture = !day.completionAvailableAt || new Date(day.completionAvailableAt).getTime() > Date.now(); return <div className="trial-progress-row" key={day.ordinal}><span><b>Service day {day.ordinal}</b><small>{friendlyDate(day.scheduledFor)} · {helperActiveBooking.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</small></span>{day.status === "completed" ? <Mark muted>Completed</Mark> : day.ordinal === nextTrialOrdinal ? <button className="compact-action" disabled={requestBusy || isFuture} title={isFuture ? `Available ${friendlyDateTime(day.completionAvailableAt)}` : undefined} onClick={() => void completeTrialDay(day.ordinal)}>{isFuture ? `Available ${friendlyDateTime(day.completionAvailableAt)}` : requestBusy ? "Saving…" : "Mark completed"}</button> : <Mark muted>Upcoming</Mark>}</div>; })}{requestError && <p className="auth-error" role="alert">{requestError}</p>}<small>A service day can be marked complete only after its final scheduled visit has ended.</small></section>}
           {trialPayment && <section className="payment-action-card"><Mark>{trialPayment.status === "resident_marked_paid" ? "Confirmation needed" : trialPayment.status === "pending" ? "Awaiting payment" : "Under review"}</Mark><h2>₹{trialPayment.amountRupees.toLocaleString("en-IN")} trial payment</h2>{trialPayment.status === "resident_marked_paid" ? <><p>{trialPayment.residentName} marked the payment as sent. Check your payment app before confirming.</p><button className="primary" disabled={paymentBusy} onClick={() => void updateTrialPayment("confirm_received")}>{paymentBusy ? "Confirming…" : "Payment received"}</button></> : trialPayment.status === "pending" ? <p>{trialPayment.residentName} has not marked the payment as sent yet. The “Payment received” button will appear here after she does.</p> : <p>The resident requested backend review. Your time remains available for other bookings.</p>}{paymentError && <p className="auth-error" role="alert">{paymentError}</p>}</section>}
           <section className="dashboard-block"><div className="section-head"><h2>Services and prices</h2><button onClick={() => navTo("setup")}>Edit</button></div>{helperPriceRows.length ? <div className="price-catalogue dashboard-prices">{helperPriceRows.map(row => <div key={row.label}><span>{row.label}</span><strong>₹{row.price.toLocaleString("en-IN")}<small>/month</small></strong></div>)}</div> : <div className="empty-dashboard"><b>No services added yet</b><p>Add services and monthly prices to appear in resident searches.</p><button className="secondary" onClick={() => navTo("setup")}>Complete work profile</button></div>}</section>
-          <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div>{helperActiveBookings.length ? <><div className="job-list">{helperActiveBookings.map(item => <button className={item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><b>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</b><span><strong>{item.residentName}</strong><small>{item.residentAddress} · {item.bookingStatus === "trial" ? "paid trial" : "confirmed booking"}</small></span></button>)}</div>{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</> : <div className="empty-dashboard"><b>No confirmed work yet</b><p>Accepted bookings will appear here.</p></div>}</section>
-          <section className="dashboard-block"><div className="section-head"><h2>Availability</h2><button onClick={() => navTo("setup")}>Edit</button></div><div className="availability-control"><span className={profilePaused?"dot paused":"dot"}/><span><b>{profilePaused?"Profile paused":"Profile is active"}</b><small>{profilePaused?"Residents cannot find you":`${availabilitySlots.filter(slot => slot.start && slot.end).length} recurring time ${availabilitySlots.filter(slot => slot.start && slot.end).length === 1 ? "window" : "windows"} available`}</small></span><input aria-label="Show profile in resident searches" type="checkbox" disabled={profilePauseBusy} checked={!profilePaused} onChange={event => void setHelperProfilePaused(!event.target.checked)} /></div>{setupError && <p className="auth-error" role="alert">{setupError}</p>}</section>
+          {helperSchedule}
+          <section className="dashboard-block"><div className="section-head"><h2>Availability</h2><button onClick={() => navTo("setup")}>Edit</button></div><div className="availability-control"><span className={profilePaused?"dot paused":"dot"}/><span><b>{savedProfileStatus === "active" ? "Profile is active" : savedProfileStatus === "paused" ? "Profile paused" : "Profile not visible"}</b><small>{savedProfileStatus !== "active" ? "Residents cannot find you" : "Update your recurring working hours"}</small></span><input aria-label="Show profile in resident searches" type="checkbox" disabled={profilePauseBusy || !["active", "paused"].includes(savedProfileStatus)} checked={savedProfileStatus === "active"} onChange={event => void setHelperProfilePaused(!event.target.checked)} /></div>{setupError && <p className="auth-error" role="alert">{setupError}</p>}</section>
           <section className="dashboard-block"><div className="section-head"><h2>Manage</h2></div><div className="dashboard-list"><button onClick={openIssueReport}><span className="list-icon">!</span><span><b>Report a problem</b><small>Payment, safety or work-scope concern</small></span><span>›</span></button></div></section>
         </div>}
 

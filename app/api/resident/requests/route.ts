@@ -1,3 +1,4 @@
+import { requireCompleteResident } from "../../../lib/profile-completeness";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
@@ -146,6 +147,8 @@ export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
     const session = await requireResident(request);
+    const db = await getD1();
+    await requireCompleteResident(db, session.user_id);
     const body = await request.json() as Record<string, unknown>;
     const helperId = typeof body.helperId === "string" ? body.helperId : "";
     const service = body.service as Service;
@@ -166,7 +169,6 @@ export async function POST(request: Request) {
       return Response.json({ error: "Choose a Monday–Saturday start date that is not in the past." }, { status: 400 });
     }
 
-    const db = await getD1();
     await expirePendingRequests(db);
     const unpaidTrial = await db.prepare(
       `SELECT id FROM trial_payments WHERE resident_user_id = ?
@@ -232,6 +234,18 @@ export async function POST(request: Request) {
     const responseDueAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
     const snapshot = { service, homeSize, cleaningVisit, firstDuration, secondDuration: needsSecond ? secondDuration : null };
     const statements = [
+      // Recheck inside the transaction: profile edits may have retired a window
+      // after the availability pre-read. No claims are made on a stale window.
+      db.prepare(`SELECT json(CASE WHEN EXISTS (
+        SELECT 1 FROM json_each(?) requested WHERE NOT EXISTS (
+          SELECT 1 FROM availability_slots a
+          WHERE a.id = json_extract(requested.value, '$.availabilitySlotId')
+            AND a.helper_user_id = ? AND a.status = 'open'
+            AND a.day_of_week = json_extract(requested.value, '$.dayOfWeek')
+            AND a.start_minute <= json_extract(requested.value, '$.start')
+            AND a.end_minute >= json_extract(requested.value, '$.end')
+        )) THEN 'stale_availability' ELSE 'true' END)`)
+        .bind(JSON.stringify(requestedSlots), helperId),
       db.prepare(
         `INSERT INTO booking_requests
          (id, resident_user_id, helper_user_id, resident_address_id, package_snapshot_json, monthly_price_paise, requested_start_date, status, response_due_at)
@@ -275,6 +289,9 @@ export async function POST(request: Request) {
     return Response.json({ requestId, responseDueAt, status: "pending" });
   } catch (error) {
     if (error instanceof Response) return error;
+    if (error instanceof Error && error.message.includes("malformed JSON")) {
+      return Response.json({ error: "The selected time changed. Refresh your matches." }, { status: 409 });
+    }
     if (isUniqueConstraintError(error)) {
       return Response.json({ error: "This time was just booked by someone else. Please choose another match." }, { status: 409 });
     }

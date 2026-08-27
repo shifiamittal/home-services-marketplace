@@ -1,3 +1,4 @@
+import { residentProfileComplete } from "../../../../lib/profile-completeness";
 import { AppRole, assertSameOrigin, createSession, getD1, roleForStorage, verifyMsg91AccessToken } from "../../../../lib/auth";
 
 export async function POST(request: Request) {
@@ -48,7 +49,8 @@ export async function POST(request: Request) {
       "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'mobile_sign_in_completed', ?)",
     ).bind(crypto.randomUUID(), user.id, JSON.stringify({ role })).run();
     const cookies = await createSession(user.id, role);
-    let profileComplete = Boolean(user.name.trim());
+    let profileComplete = role === "resident"
+      ? await residentProfileComplete(db, user.id) : Boolean(user.name.trim());
     if (role === "provider" && profileComplete) {
       const profile = await db.prepare(
         "SELECT profile_status FROM helper_profiles WHERE user_id = ? LIMIT 1",
