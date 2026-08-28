@@ -2,7 +2,7 @@ import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
 import { serviceCompletionAvailableAt } from "../../../lib/service-time";
-import { expirePendingRequests, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
+import { ELIGIBLE_HELPER_SQL, deadlineInstant, expirePendingRequests, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 function formatMinute(value: number) {
   return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
@@ -33,7 +33,7 @@ async function requireHelper(request: Request) {
   return session;
 }
 
-async function requestDetails(db: D1Database, requestId: string, revealContact: boolean) {
+async function requestDetails(db: D1Database, requestId: string, helperId: string, revealContact: boolean, requireEligible = false) {
   const item = await db.prepare(
     `SELECT br.id, br.status, br.resident_user_id, br.helper_user_id, br.package_snapshot_json,
             br.monthly_price_paise, br.requested_start_date, br.response_due_at, br.responded_at,
@@ -45,9 +45,12 @@ async function requestDetails(db: D1Database, requestId: string, revealContact: 
      JOIN users u ON u.id = br.resident_user_id
      JOIN resident_addresses ra ON ra.id = br.resident_address_id
      LEFT JOIN bookings b ON b.request_id = br.id
-     WHERE br.id = ? LIMIT 1`,
-  ).bind(requestId).first<Record<string, string | number | null>>();
+     WHERE br.id = ? AND br.helper_user_id = ? AND ra.resident_user_id = br.resident_user_id
+       AND (NOT ? OR EXISTS (SELECT 1 FROM helper_profiles hp JOIN users u ON u.id = hp.user_id
+         WHERE hp.user_id = br.helper_user_id AND ${ELIGIBLE_HELPER_SQL})) LIMIT 1`,
+  ).bind(requestId, helperId, requireEligible ? 1 : 0).first<Record<string, string | number | null>>();
   if (!item) return null;
+  revealContact = revealContact && item.status === "accepted" && Boolean(item.booking_id);
   const slots = await db.prepare(
     `SELECT visit_ordinal, MIN(start_minute) AS start_minute, MAX(end_minute) AS end_minute,
             MAX(includes_house_cleaning) AS includes_house_cleaning
@@ -91,7 +94,8 @@ async function requestDetails(db: D1Database, requestId: string, revealContact: 
     residentId: item.resident_user_id,
     residentName: item.resident_name,
     residentMobile: revealContact ? item.resident_mobile : null,
-    residentLocality: item.locality,
+    // Legacy locality is untrusted free text and may be a complete address.
+    residentLocality: revealContact ? item.locality : null,
     residentAddress: revealContact ? `${item.house_or_flat}, ${item.street_or_block || item.locality}` : null,
     package: JSON.parse(String(item.package_snapshot_json)),
     monthlyPriceRupees: Number(item.monthly_price_paise) / 100,
@@ -129,15 +133,15 @@ export async function GET(request: Request) {
     await expirePendingRequests(db);
     const pending = await db.prepare(
       `SELECT id FROM booking_requests
-       WHERE helper_user_id = ? AND status = 'pending' AND response_due_at > CURRENT_TIMESTAMP
-       ORDER BY response_due_at ASC LIMIT 1`,
+       WHERE helper_user_id = ? AND status = 'pending' AND COALESCE(${deadlineInstant("response_due_at")} > julianday('now'), 0)
+       ORDER BY ${deadlineInstant("response_due_at")} ASC, id LIMIT 1`,
     ).bind(session.user_id).first<{ id: string }>();
     const active = await db.prepare(
       `SELECT br.id FROM booking_requests br JOIN bookings b ON b.request_id = br.id
        WHERE br.helper_user_id = ? AND b.status IN ('trial', 'active', 'ending')
        ORDER BY b.created_at DESC`,
     ).bind(session.user_id).all<{ id: string }>();
-    const activeBookings = await Promise.all(active.results.map(item => requestDetails(db, item.id, true)));
+    const activeBookings = await Promise.all(active.results.map(item => requestDetails(db, item.id, session.user_id, true)));
     const payment = await db.prepare(
       `SELECT tp.id, tp.amount_paise, tp.status, tp.transaction_reference, tp.resident_marked_paid_at,
               u.name AS resident_name
@@ -146,7 +150,7 @@ export async function GET(request: Request) {
        ORDER BY tp.created_at DESC LIMIT 1`,
     ).bind(session.user_id).first<Record<string, string | number | null>>();
     return Response.json({
-      pendingRequest: pending ? await requestDetails(db, pending.id, false) : null,
+      pendingRequest: pending ? await requestDetails(db, pending.id, session.user_id, false) : null,
       activeBooking: activeBookings[0] ?? null,
       activeBookings: activeBookings.filter(Boolean),
       paymentPending: payment ? {
@@ -176,18 +180,28 @@ export async function POST(request: Request) {
     await expirePendingRequests(db);
     const item = await db.prepare(
       `SELECT br.id, br.resident_user_id, br.status, br.response_due_at, br.package_snapshot_json,
-              br.requested_start_date, u.name AS resident_name, u.mobile_e164 AS resident_mobile
+              br.requested_start_date, u.name AS resident_name, u.mobile_e164 AS resident_mobile,
+              COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0) AS deadline_live
        FROM booking_requests br JOIN users u ON u.id = br.resident_user_id
        WHERE br.id = ? AND br.helper_user_id = ? LIMIT 1`,
-    ).bind(requestId, session.user_id).first<{ id: string; resident_user_id: string; status: string; response_due_at: string; package_snapshot_json: string; requested_start_date: string; resident_name: string; resident_mobile: string }>();
-    if (!item || item.status !== "pending" || new Date(item.response_due_at).getTime() <= Date.now()) {
+    ).bind(requestId, session.user_id).first<{ id: string; resident_user_id: string; status: string; response_due_at: string; package_snapshot_json: string; requested_start_date: string; resident_name: string; resident_mobile: string; deadline_live: number }>();
+    if (!item || item.status !== "pending" || item.deadline_live !== 1) {
       return Response.json({ error: "This request is no longer awaiting a response." }, { status: 409 });
     }
+
+    // Deadline and ownership are checked again at mutation time, not using
+    // the JS parse of a possibly zone-less timestamp or a stale pre-read.
+    const responseGuard = () => db.prepare(`SELECT json(CASE WHEN EXISTS (
+      SELECT 1 FROM booking_requests br WHERE br.id = ? AND br.helper_user_id = ?
+        AND br.resident_user_id = ? AND br.status = 'pending'
+        AND COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0)
+    ) THEN 'true' ELSE 'request_response_conflict' END)`).bind(requestId, session.user_id, item.resident_user_id);
 
     if (decision === "decline") {
       const snapshot = JSON.parse(item.package_snapshot_json) as { service?: string };
       try {
         await db.batch([
+        responseGuard(),
         transitionGuard(db, "booking_request", requestId, "pending", "declined", session.user_id),
         db.prepare("UPDATE booking_requests SET status = 'declined', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND helper_user_id = ? AND status = 'pending'")
           .bind(requestId, session.user_id),
@@ -230,6 +244,20 @@ export async function POST(request: Request) {
     ).bind(requestId).all<{ availability_slot_id: string; visit_ordinal: number; day_of_week: number; start_minute: number; end_minute: number }>();
     if (!slots.results.length) return Response.json({ error: "The held time could not be found." }, { status: 409 });
     const statements = [
+      responseGuard(),
+      // Authorize the assigned helper inside the same atomic batch, before any
+      // transition, booking, history or claim mutation. A pre-read is not authority.
+      db.prepare(`SELECT json(CASE WHEN EXISTS (
+        SELECT 1 FROM booking_requests br
+        JOIN helper_profiles hp ON hp.user_id = br.helper_user_id
+        JOIN users u ON u.id = hp.user_id
+        WHERE br.id = ? AND br.helper_user_id = ? AND ${ELIGIBLE_HELPER_SQL}
+      ) THEN 'true' ELSE 'request_response_conflict' END)`).bind(requestId, session.user_id),
+      db.prepare(`SELECT json(CASE WHEN EXISTS (
+        SELECT 1 FROM bookings WHERE resident_user_id = ? AND status IN ('trial', 'active', 'ending')
+      ) OR EXISTS (
+        SELECT 1 FROM booking_requests WHERE resident_user_id = ? AND id != ? AND status = 'pending'
+      ) THEN 'resident_lifecycle_conflict' ELSE 'true' END)`).bind(item.resident_user_id, item.resident_user_id, requestId),
       transitionGuard(db, "booking_request", requestId, "pending", "accepted", session.user_id),
       db.prepare("UPDATE booking_requests SET status = 'accepted', responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND helper_user_id = ? AND status = 'pending'")
         .bind(requestId, session.user_id),
@@ -291,10 +319,13 @@ export async function POST(request: Request) {
       url: "/",
       tag: `booking-confirmed-${bookingId}`,
     });
-    const acceptedRequest = await requestDetails(db, requestId, true);
+    const acceptedRequest = await requestDetails(db, requestId, session.user_id, true, true);
     return Response.json({ status: "accepted", bookingId, cycleEndsAt, request: acceptedRequest });
   } catch (error) {
     if (error instanceof Response) return error;
+    if (error instanceof Error && error.message.includes("malformed JSON")) {
+      return Response.json({ error: "This request is no longer awaiting a response." }, { status: 409 });
+    }
     return Response.json({ error: "We could not save your response. Please try again." }, { status: 500 });
   }
 }

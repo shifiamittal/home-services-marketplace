@@ -2,7 +2,7 @@ import { requireCompleteResident } from "../../../lib/profile-completeness";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
-import { expirePendingRequests, insertSlotClaims, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
+import { ELIGIBLE_HELPER_SQL, deadlineInstant, expirePendingRequests, insertSlotClaims, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
 
 type Service = "house_cleaning" | "utensils_once" | "utensils_twice" | "house_plus_utensils_once" | "house_plus_utensils_twice";
 type HomeSize = "one_two_bhk" | "three_bhk" | "four_plus_bhk";
@@ -60,7 +60,7 @@ export async function GET(request: Request) {
   try {
     const session = await requireResident(request);
     const db = await getD1();
-    await expirePendingRequests(db);
+    await expirePendingRequests(db, undefined, session.user_id);
     const payment = await db.prepare(
       `SELECT tp.id, tp.amount_paise, tp.status, tp.transaction_reference, tp.resident_marked_paid_at,
               u.name AS helper_name, u.mobile_e164 AS helper_mobile
@@ -169,7 +169,7 @@ export async function POST(request: Request) {
       return Response.json({ error: "Choose a Monday–Saturday start date that is not in the past." }, { status: 400 });
     }
 
-    await expirePendingRequests(db);
+    await expirePendingRequests(db, undefined, session.user_id);
     const unpaidTrial = await db.prepare(
       `SELECT id FROM trial_payments WHERE resident_user_id = ?
        AND status IN ('pending', 'resident_marked_paid') LIMIT 1`,
@@ -187,8 +187,8 @@ export async function POST(request: Request) {
     if (!address) return Response.json({ error: "Add your home address before requesting a booking." }, { status: 400 });
     const helper = await db.prepare(
       `SELECT hp.user_id, u.name, u.mobile_e164 FROM helper_profiles hp JOIN users u ON u.id = hp.user_id
-       WHERE hp.user_id = ? AND hp.profile_status = 'active' LIMIT 1`,
-    ).bind(helperId).first<{ user_id: string; name: string; mobile_e164: string }>();
+       WHERE hp.user_id = ? AND ${ELIGIBLE_HELPER_SQL} AND u.id != ? LIMIT 1`,
+    ).bind(helperId, session.user_id).first<{ user_id: string; name: string; mobile_e164: string }>();
     if (!helper) return Response.json({ error: "This helper’s profile is not currently available." }, { status: 409 });
     const offerings = await db.prepare(
       "SELECT service_type, home_size, monthly_price_paise FROM helper_offerings WHERE helper_user_id = ? AND is_active = 1",
@@ -220,7 +220,7 @@ export async function POST(request: Request) {
     const busy = await db.prepare(
       `SELECT rs.day_of_week, rs.start_minute, rs.end_minute
        FROM request_slots rs JOIN booking_requests br ON br.id = rs.request_id
-       WHERE br.helper_user_id = ? AND br.status = 'pending' AND br.response_due_at > CURRENT_TIMESTAMP
+       WHERE br.helper_user_id = ? AND br.status = 'pending' AND COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0)
        UNION ALL
        SELECT bs.day_of_week, bs.start_minute, bs.end_minute
        FROM booking_slots bs JOIN bookings b ON b.id = bs.booking_id
@@ -234,6 +234,32 @@ export async function POST(request: Request) {
     const responseDueAt = new Date(Date.now() + 24 * 60 * 60 * 1_000).toISOString();
     const snapshot = { service, homeSize, cleaningVisit, firstDuration, secondDuration: needsSecond ? secondDuration : null };
     const statements = [
+      // A bounded global sweep may leave unrelated expired rows. Reclaim this
+      // helper's expired, unbooked holds atomically before attempting new claims.
+      db.prepare(`DELETE FROM slot_claims WHERE helper_user_id = ? AND booking_id IS NULL
+        AND request_id IN (SELECT br.id FROM booking_requests br
+          WHERE br.status = 'expired' OR (br.status = 'pending'
+            AND NOT COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0)))
+        AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.request_id = slot_claims.request_id
+          AND b.status IN ('trial', 'active', 'ending'))`).bind(helperId),
+      // Authoritative admission guard. All reads and the insert/claims share
+      // one D1 batch; a lifecycle/profile/address pre-read grants no authority.
+      db.prepare(`SELECT json(CASE WHEN
+        EXISTS (SELECT 1 FROM users u JOIN resident_profiles rp ON rp.user_id = u.id
+          JOIN resident_addresses ra ON ra.resident_user_id = u.id
+          WHERE u.id = ? AND u.status = 'active' AND length(trim(u.name)) BETWEEN 1 AND 120
+            AND ra.id = ? AND ra.is_primary = 1 AND trim(ra.house_or_flat) != '' AND trim(ra.locality) != ''
+            AND typeof(ra.latitude_e6) = 'integer' AND ra.latitude_e6 BETWEEN -90000000 AND 90000000
+            AND typeof(ra.longitude_e6) = 'integer' AND ra.longitude_e6 BETWEEN -180000000 AND 180000000
+            AND (ra.latitude_e6 != 0 OR ra.longitude_e6 != 0))
+        AND EXISTS (SELECT 1 FROM helper_profiles hp JOIN users u ON u.id = hp.user_id
+          WHERE hp.user_id = ? AND ${ELIGIBLE_HELPER_SQL} AND u.id != ?)
+        AND NOT EXISTS (SELECT 1 FROM booking_requests WHERE resident_user_id = ? AND status = 'pending')
+        AND NOT EXISTS (SELECT 1 FROM bookings WHERE resident_user_id = ? AND status IN ('trial', 'active', 'ending'))
+        AND NOT EXISTS (SELECT 1 FROM trial_payments WHERE resident_user_id = ? AND status IN ('pending', 'resident_marked_paid'))
+        AND julianday(?) > julianday('now')
+        THEN 'true' ELSE 'request_admission_conflict' END)`)
+        .bind(session.user_id, address.id, helperId, session.user_id, session.user_id, session.user_id, session.user_id, responseDueAt),
       // Recheck inside the transaction: profile edits may have retired a window
       // after the availability pre-read. No claims are made on a stale window.
       db.prepare(`SELECT json(CASE WHEN EXISTS (
@@ -290,7 +316,7 @@ export async function POST(request: Request) {
   } catch (error) {
     if (error instanceof Response) return error;
     if (error instanceof Error && error.message.includes("malformed JSON")) {
-      return Response.json({ error: "The selected time changed. Refresh your matches." }, { status: 409 });
+      return Response.json({ error: "Your booking details changed. Refresh and try again." }, { status: 409 });
     }
     if (isUniqueConstraintError(error)) {
       return Response.json({ error: "This time was just booked by someone else. Please choose another match." }, { status: 409 });

@@ -1,3 +1,5 @@
+import { storedCoordinates } from "../../../lib/address-integrity";
+import { ELIGIBLE_HELPER_SQL, deadlineInstant, expirePendingRequests } from "../../../lib/workflow-integrity";
 import { requireCompleteResident } from "../../../lib/profile-completeness";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 
@@ -73,18 +75,21 @@ function candidateStarts(requested: number, flexibility: number) {
   return candidates;
 }
 
-function recurringStart(slots: SlotRow[], busy: BusyRow[], requested: number, duration: number, flexibility: number) {
+function recurringStarts(slots: SlotRow[], busy: BusyRow[], claims: Set<string>, requested: number, duration: number, flexibility: number) {
+  const starts: number[] = [];
   for (const candidate of candidateStarts(requested, flexibility)) {
     const availableEveryDay = weekdays.every(day => {
       const insideAvailability = slots.some(slot => slot.day_of_week === day
         && slot.start_minute <= candidate && slot.end_minute >= candidate + duration);
       const overlapsBusyTime = busy.some(item => item.day_of_week === day
         && candidate < item.end_minute + 15 && item.start_minute < candidate + duration + 15);
-      return insideAvailability && !overlapsBusyTime;
+      const overlapsClaim = Array.from({ length: duration + 15 }, (_, offset) => candidate + offset)
+        .some(minute => claims.has(`${(day + Math.floor(minute / 1440)) % 7}:${minute % 1440}`));
+      return insideAvailability && !overlapsBusyTime && !overlapsClaim;
     });
-    if (availableEveryDay) return candidate;
+    if (availableEveryDay) starts.push(candidate);
   }
-  return null;
+  return starts;
 }
 
 function packagePrice(offerings: OfferingRow[], service: Service, homeSize: HomeSize) {
@@ -129,6 +134,7 @@ export async function POST(request: Request) {
       return Response.json({ error: "Choose a valid service, home size and preferred time." }, { status: 400 });
     }
 
+    await expirePendingRequests(db, undefined, session.user_id);
     const unpaidTrial = await db.prepare(
       `SELECT id FROM trial_payments WHERE resident_user_id = ?
        AND status IN ('pending', 'resident_marked_paid') LIMIT 1`,
@@ -149,11 +155,12 @@ export async function POST(request: Request) {
       `SELECT latitude_e6, longitude_e6 FROM resident_addresses
        WHERE resident_user_id = ? AND is_primary = 1 LIMIT 1`,
     ).bind(session.user_id).first<{ latitude_e6: number | null; longitude_e6: number | null }>();
-    if (!address || typeof address.latitude_e6 !== "number" || typeof address.longitude_e6 !== "number") {
+    const residentPoint = address ? storedCoordinates(address.latitude_e6, address.longitude_e6) : null;
+    if (!residentPoint) {
       return Response.json({ error: "Add your home address before searching for helpers." }, { status: 400 });
     }
 
-    const [helpersResult, offeringsResult, slotsResult, reviewsResult, busyResult] = await Promise.all([
+    const [helpersResult, offeringsResult, slotsResult, reviewsResult, busyResult, claimsResult] = await Promise.all([
       db.prepare(
         `SELECT hp.user_id, u.name, hp.latitude_e6, hp.longitude_e6, hp.max_travel_distance_meters,
                 hp.years_experience,
@@ -162,8 +169,10 @@ export async function POST(request: Request) {
                   WHERE vd.helper_user_id = hp.user_id AND vd.status IN ('pending', 'verified')
                 ) THEN 'verified' ELSE hp.verification_status END AS verification_status
          FROM helper_profiles hp JOIN users u ON u.id = hp.user_id
-         WHERE hp.profile_status = 'active' AND u.status = 'active'
-           AND hp.latitude_e6 IS NOT NULL AND hp.longitude_e6 IS NOT NULL`,
+         WHERE ${ELIGIBLE_HELPER_SQL}
+           AND typeof(hp.latitude_e6) = 'integer' AND hp.latitude_e6 BETWEEN -90000000 AND 90000000
+           AND typeof(hp.longitude_e6) = 'integer' AND hp.longitude_e6 BETWEEN -180000000 AND 180000000
+           AND (hp.latitude_e6 != 0 OR hp.longitude_e6 != 0)`,
       ).all<HelperRow>(),
       db.prepare(
         `SELECT helper_user_id, service_type, home_size, monthly_price_paise
@@ -180,12 +189,18 @@ export async function POST(request: Request) {
       db.prepare(
         `SELECT br.helper_user_id, rs.day_of_week, rs.start_minute, rs.end_minute
          FROM request_slots rs JOIN booking_requests br ON br.id = rs.request_id
-         WHERE br.status = 'pending' AND br.response_due_at > CURRENT_TIMESTAMP
+         WHERE br.status = 'pending' AND COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0)
          UNION ALL
          SELECT b.helper_user_id, bs.day_of_week, bs.start_minute, bs.end_minute
          FROM booking_slots bs JOIN bookings b ON b.id = bs.booking_id
          WHERE b.status IN ('trial', 'active', 'ending')`,
       ).all<BusyRow>(),
+      db.prepare(`SELECT sc.helper_user_id, sc.day_of_week, sc.minute_of_day
+        FROM slot_claims sc JOIN booking_requests br ON br.id = sc.request_id
+        LEFT JOIN bookings b ON b.id = sc.booking_id
+        WHERE (br.status = 'pending' AND COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0))
+          OR b.status IN ('trial', 'active', 'ending')`)
+        .all<{ helper_user_id: string; day_of_week: number; minute_of_day: number }>(),
     ]);
 
     const offeringsByHelper = new Map<string, OfferingRow[]>();
@@ -208,6 +223,13 @@ export async function POST(request: Request) {
       busyByHelper.set(item.helper_user_id, list);
     }
 
+    const claimsByHelper = new Map<string, Set<string>>();
+    for (const claim of claimsResult.results) {
+      const claims = claimsByHelper.get(claim.helper_user_id) ?? new Set<string>();
+      claims.add(`${claim.day_of_week}:${claim.minute_of_day}`);
+      claimsByHelper.set(claim.helper_user_id, claims);
+    }
+
     const firstDuration = service === "house_cleaning"
       ? cleaningDuration(homeSize)
       : service === "utensils_once" || service === "utensils_twice"
@@ -220,25 +242,30 @@ export async function POST(request: Request) {
       : 30;
     const needsSecondVisit = service === "utensils_twice" || service === "house_plus_utensils_twice";
 
-    const residentLatitude = address.latitude_e6 / 1_000_000;
-    const residentLongitude = address.longitude_e6 / 1_000_000;
+    const residentLatitude = residentPoint.latitude / 1_000_000;
+    const residentLongitude = residentPoint.longitude / 1_000_000;
     const matches = helpersResult.results.flatMap(helper => {
       const helperOfferings = offeringsByHelper.get(helper.user_id) ?? [];
       const monthlyPricePaise = packagePrice(helperOfferings, service, homeSize);
       if (monthlyPricePaise == null) return [];
       const helperSlots = slotsByHelper.get(helper.user_id) ?? [];
       const helperBusy = busyByHelper.get(helper.user_id) ?? [];
-      const firstStart = recurringStart(helperSlots, helperBusy, firstRequested, firstDuration, flexibility);
-      if (firstStart == null) return [];
-      const secondStart = needsSecondVisit
-        ? recurringStart(helperSlots, helperBusy, secondRequested, secondDuration, flexibility)
-        : null;
-      if (needsSecondVisit && secondStart == null) return [];
-      if (secondStart != null) {
-        const separated = firstStart + firstDuration + 15 <= secondStart
-          || secondStart + secondDuration + 15 <= firstStart;
-        if (!separated) return [];
+      const claims = claimsByHelper.get(helper.user_id) ?? new Set<string>();
+      const firstStarts = recurringStarts(helperSlots, helperBusy, claims, firstRequested, firstDuration, flexibility);
+      const secondStarts = needsSecondVisit
+        ? recurringStarts(helperSlots, helperBusy, claims, secondRequested, secondDuration, flexibility) : [];
+      let pair: { first: number; second: number | null; deviation: number } | null = null;
+      // Preserve the legacy summed-deviation score and candidate tie order,
+      // but search both visits jointly instead of discarding a feasible helper.
+      for (const first of firstStarts) {
+        for (const second of needsSecondVisit ? secondStarts : [null]) {
+          if (second !== null && !(first + firstDuration + 15 <= second || second + secondDuration + 15 <= first)) continue;
+          const deviation = Math.abs(first - firstRequested) + (second === null ? 0 : Math.abs(second - secondRequested));
+          if (!pair || deviation < pair.deviation) pair = { first, second, deviation };
+        }
       }
+      if (!pair) return [];
+      const firstStart = pair.first, secondStart = pair.second;
 
       const distanceKm = haversineKm(
         residentLatitude,
@@ -270,7 +297,7 @@ export async function POST(request: Request) {
         reviewCount: Number(review?.review_count ?? 0),
         score,
       }];
-    }).sort((first, second) => first.score - second.score);
+    }).sort((first, second) => first.score - second.score || (first.id < second.id ? -1 : first.id > second.id ? 1 : 0));
 
     await db.prepare(
       "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'resident_matches_viewed', ?)",

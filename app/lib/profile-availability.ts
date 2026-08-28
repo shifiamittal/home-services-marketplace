@@ -1,3 +1,5 @@
+import { deadlineInstant } from "./workflow-integrity";
+
 export type ProfileWindow = { day: number; start: number; end: number; pattern: string };
 
 // Evaluated INSIDE the save batch, not just in a pre-read. Concurrent request
@@ -8,7 +10,7 @@ export function commitmentGuard(db: D1Database, helperId: string, windows: Profi
       SELECT rs.day_of_week AS day, rs.start_minute AS start, rs.end_minute AS end
       FROM request_slots rs JOIN booking_requests br ON br.id = rs.request_id
       WHERE br.helper_user_id = ? AND br.status = 'pending'
-        AND julianday(br.response_due_at) > julianday('now')
+        AND COALESCE(${deadlineInstant("br.response_due_at")} > julianday('now'), 0)
       UNION ALL
       SELECT bs.day_of_week, bs.start_minute, bs.end_minute
       FROM booking_slots bs JOIN bookings b ON b.id = bs.booking_id

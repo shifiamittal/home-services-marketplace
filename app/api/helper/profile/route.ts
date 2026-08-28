@@ -1,3 +1,4 @@
+import { coordinates, effectiveLocationText, effectiveLocationTextSql, storedCoordinates } from "../../../lib/address-integrity";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 
 import { fieldError, profileFailure } from "../../../lib/profile-errors";
@@ -66,13 +67,14 @@ export async function GET(request: Request) {
       });
     }
 
+    const point = profile ? storedCoordinates(profile.latitude_e6, profile.longitude_e6) : null;
     return Response.json({
       exists: Boolean(profile),
       profile: profile ? {
         locality: profile.home_locality,
-        homeAddress: profile.home_address || "",
-        latitude: typeof profile.latitude_e6 === "number" ? profile.latitude_e6 / 1_000_000 : null,
-        longitude: typeof profile.longitude_e6 === "number" ? profile.longitude_e6 / 1_000_000 : null,
+        homeAddress: effectiveLocationText(profile.home_address, null),
+        latitude: point?.latitude == null ? null : point.latitude / 1_000_000,
+        longitude: point?.longitude == null ? null : point.longitude / 1_000_000,
         travelDistanceKm: typeof profile.max_travel_distance_meters === "number" ? profile.max_travel_distance_meters / 1_000 : null,
         landmark: profile.landmark || "",
         yearsExperience: profile.years_experience,
@@ -111,11 +113,13 @@ export async function PUT(request: Request) {
     if (!body || typeof body !== "object" || Array.isArray(body)) return fieldError("profile", "Provide a valid profile.");
     const locality = typeof body.locality === "string" ? body.locality.trim() : "";
     const homeAddress = typeof body.homeAddress === "string" ? body.homeAddress.trim() : "";
-    const latitude = typeof body.latitude === "number" ? body.latitude : NaN;
-    const longitude = typeof body.longitude === "number" ? body.longitude : NaN;
+    let point;
+    try { point = coordinates(body.latitude, body.longitude); }
+    catch { return fieldError("address", "Choose a valid address location."); }
+    const omittedCoordinates = body.latitude === undefined && body.longitude === undefined;
     const travelDistanceKm = Number(body.travelDistanceKm);
     const yearsExperience = Number(body.yearsExperience);
-    if (!locality || locality.length > 160 || !homeAddress || homeAddress.length > 300 || !Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    if (!locality || locality.length > 160 || !homeAddress || homeAddress.length > 300) {
       return fieldError("address", "Choose your starting address from Google suggestions.");
     }
     if (!Number.isFinite(travelDistanceKm) || travelDistanceKm <= 0 || travelDistanceKm > 500) {
@@ -188,11 +192,22 @@ export async function PUT(request: Request) {
            (user_id, home_locality, home_address, latitude_e6, longitude_e6, max_travel_distance_meters, years_experience, profile_status)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
          ON CONFLICT(user_id) DO UPDATE SET home_locality = excluded.home_locality, home_address = excluded.home_address,
-         latitude_e6 = excluded.latitude_e6, longitude_e6 = excluded.longitude_e6,
+         latitude_e6 = CASE WHEN ? AND ${effectiveLocationTextSql('helper_profiles.home_address', 'NULL')} = excluded.home_address
+           AND ${effectiveLocationTextSql('helper_profiles.home_locality', 'NULL')} = excluded.home_locality
+           AND typeof(helper_profiles.latitude_e6) = 'integer' AND typeof(helper_profiles.longitude_e6) = 'integer'
+           AND helper_profiles.latitude_e6 BETWEEN -90000000 AND 90000000 AND helper_profiles.longitude_e6 BETWEEN -180000000 AND 180000000
+           AND (helper_profiles.latitude_e6 != 0 OR helper_profiles.longitude_e6 != 0)
+           THEN helper_profiles.latitude_e6 ELSE excluded.latitude_e6 END,
+         longitude_e6 = CASE WHEN ? AND ${effectiveLocationTextSql('helper_profiles.home_address', 'NULL')} = excluded.home_address
+           AND ${effectiveLocationTextSql('helper_profiles.home_locality', 'NULL')} = excluded.home_locality
+           AND typeof(helper_profiles.latitude_e6) = 'integer' AND typeof(helper_profiles.longitude_e6) = 'integer'
+           AND helper_profiles.latitude_e6 BETWEEN -90000000 AND 90000000 AND helper_profiles.longitude_e6 BETWEEN -180000000 AND 180000000
+           AND (helper_profiles.latitude_e6 != 0 OR helper_profiles.longitude_e6 != 0)
+           THEN helper_profiles.longitude_e6 ELSE excluded.longitude_e6 END,
          max_travel_distance_meters = excluded.max_travel_distance_meters, years_experience = excluded.years_experience,
          profile_status = CASE WHEN helper_profiles.profile_status IN ('draft', 'active')
            THEN 'active' ELSE helper_profiles.profile_status END, updated_at = CURRENT_TIMESTAMP`,
-      ).bind(session.user_id, locality, homeAddress, Math.round(latitude * 1_000_000), Math.round(longitude * 1_000_000), Math.round(travelDistanceKm * 1_000), yearsExperience),
+      ).bind(session.user_id, locality, homeAddress, point.latitude, point.longitude, Math.round(travelDistanceKm * 1_000), yearsExperience, Number(omittedCoordinates), Number(omittedCoordinates)),
       db.prepare("DELETE FROM helper_offerings WHERE helper_user_id = ?").bind(session.user_id),
       ...saveAvailability(db, session.user_id, availability.flatMap(group => patternDays[group.pattern].map(day => ({ day, start: group.start, end: group.end, pattern: group.pattern })))),
     ];

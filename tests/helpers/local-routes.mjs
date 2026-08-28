@@ -6,31 +6,65 @@ import { createRequire } from "node:module";
 import ts from "typescript";
 
 // Synthetic in-memory D1 adapter. No network, providers, credentials or disk DB.
-export function fixture() {
+export function fixture({ clock } = {}) {
   const sql = new DatabaseSync(":memory:");
+  // Fixed, mutable clock for deadline/race tests, including SQL's UTC clock.
+  const ClockDate = clock ? class extends Date {
+    constructor(...args) { super(...(args.length ? args : [clock.now])); }
+    static now() { return new Date(clock.now).getTime(); }
+  } : Date;
+  if (clock) {
+    const calendar = new DatabaseSync(":memory:");
+    sql.function("julianday", { varargs: true }, (...args) => calendar.prepare(
+      `SELECT julianday(${args.map(() => "?").join(",")}) AS value`,
+    ).get(...args.map(value => value === "now" ? clock.now : value)).value);
+    const close = sql.close.bind(sql);
+    sql.close = () => { calendar.close(); close(); };
+  }
   sql.exec("PRAGMA foreign_keys=ON");
   const migrations = readdirSync("drizzle").filter(name => /^\d{4}.*\.sql$/.test(name)).sort();
   if (migrations.length !== 11) throw new Error("Review migration fixture count");
   for (const file of migrations) sql.exec(readFileSync(path.join("drizzle", file), "utf8"));
+  // D1 returns JSON numbers. Read SQLite int64 values without node:sqlite's
+  // safe-integer exception, then model that number conversion at the adapter boundary.
+  function rows(query, values) {
+    const statement = sql.prepare(query);
+    statement.setReadBigInts(true);
+    return statement.all(...values).map(row => {
+      for (const key of Object.keys(row)) if (typeof row[key] === "bigint") row[key] = Number(row[key]);
+      return row;
+    });
+  }
   const db = {
     beforeBatch: null,
+    beforeRead: null,
+    beforeStatement: null,
     prepare(query) {
       let values = [];
       const statement = {
         query,
         bind(...args) { values = args; return statement; },
-        async first() { return sql.prepare(query).get(...values) ?? null; },
-        async all() { return { results: sql.prepare(query).all(...values), success: true }; },
+        async first() {
+          const result = rows(query, values)[0] ?? null;
+          if (db.beforeRead) await db.beforeRead(query, result);
+          return result;
+        },
+        async all() { return { results: rows(query, values), success: true }; },
+        execute() { return { results: rows(query, values), success: true }; },
         async run() { const result = sql.prepare(query).run(...values); return { success: true, meta: { changes: Number(result.changes) } }; },
       };
       return statement;
     },
     async batch(statements) {
-      if (db.beforeBatch) { const hook = db.beforeBatch; db.beforeBatch = null; hook(); }
+      if (db.beforeBatch) { const hook = db.beforeBatch; db.beforeBatch = null; await hook(statements); }
       sql.exec("BEGIN IMMEDIATE");
       try {
         const result = [];
-        for (const statement of statements) result.push(await statement.all());
+        // A batch is atomic: never yield between its SQL statements.
+        for (const [index, statement] of statements.entries()) {
+          db.beforeStatement?.(index, statement);
+          result.push(statement.execute());
+        }
         sql.exec("COMMIT");
         return result;
       } catch (error) { sql.exec("ROLLBACK"); throw error; }
@@ -57,7 +91,7 @@ export function fixture() {
       if (id === "cloudflare:workers") return { env: { BUCKET: bucket } };
       const resolved = path.resolve(path.dirname(full), id);
       if (resolved.endsWith(path.join("lib", "auth"))) return {
-        getD1: async () => db, getSession: async () => session,
+        getD1: async () => db, getSession: async () => ({ ...session, roles: [...session.roles] }),
         roleForStorage: role => role === "provider" ? "helper" : role,
         assertSameOrigin(request) { if (request.headers.get("origin") !== new URL(request.url).origin) throw Response.json({ error: "Invalid origin" }, { status: 403 }); },
       };
@@ -66,14 +100,14 @@ export function fixture() {
       return load(existsSync(resolved) ? resolved : resolved + ".ts");
     };
     vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require, Response, Request, File, FormData,
-      URL, crypto, Uint8Array, TextEncoder, TextDecoder, Buffer, Error,
+      URL, crypto, Uint8Array, TextEncoder, TextDecoder, Buffer, Error, Date: ClockDate,
       console: { error: (...args) => logs.push(args.join(" ")) }, fetch() { throw new Error("Network forbidden"); } }, { filename: full });
     return loadedModule.exports;
   }
   sql.exec(`INSERT INTO users(id,name,mobile_e164) VALUES ('helper','Synthetic helper','+10000000000'),('resident','Synthetic resident','+10000000001');
     INSERT INTO resident_profiles(user_id) VALUES ('resident');
     INSERT INTO resident_addresses(id,resident_user_id,house_or_flat,locality,latitude_e6,longitude_e6,is_primary)
-      VALUES ('address','resident','Fixture','Fixture',0,0,1);
+      VALUES ('address','resident','Fixture','Fixture',10000000,20000000,1);
     INSERT INTO helper_profiles(user_id,home_locality,profile_status) VALUES ('helper','Fixture','active');
     INSERT INTO verification_documents(id,helper_user_id,document_type,r2_object_key,original_filename,content_type,size_bytes,status)
       VALUES ('proof','helper','other_address_proof','fixture/old.pdf','fixture.pdf','application/pdf',20,'pending');`);
@@ -85,7 +119,7 @@ export function jsonRequest(body, method = "PUT") {
 }
 
 export const profilePayload = {
-  locality: "Fixture", homeAddress: "Fixture", latitude: 0, longitude: 0,
+  locality: "Fixture", homeAddress: "Fixture", latitude: 10, longitude: 20,
   travelDistanceKm: 5, yearsExperience: 2,
   offerings: [{ serviceType: "utensils_once", homeSize: "not_applicable", monthlyPriceRupees: 500 }],
   availability: [{ days: "mon_sat", start: "08:00", end: "12:00" }],
