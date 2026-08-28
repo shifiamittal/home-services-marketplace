@@ -192,7 +192,7 @@ test("request creation rejects a window retired between the pre-read and transac
     const original = f.db.batch.bind(f.db);
     let raced = false;
     f.db.batch = async statements => {
-      if (statements[0]?.query.includes("stale_availability")) {
+      if (statements.some(statement => statement.query.includes("stale_availability"))) {
         raced = true;
         f.sql.exec("UPDATE availability_slots SET status='inactive'");
       }
@@ -215,7 +215,7 @@ test("resident completion survives a failed validation, then refresh/re-login re
     f.session.user_id = "resident"; f.session.role = "resident"; f.session.roles = ["resident"];
     f.sql.exec("DELETE FROM resident_profiles; UPDATE users SET name='' WHERE id='resident'");
     const complete = f.load("app/api/account/complete/route.ts").POST;
-    const body = { role: "resident", name: "  Synthetic saved  ", house: "Fixture", locality: "Fixture", formattedAddress: "Fixture", latitude: 0, longitude: 0, termsAccepted: true };
+    const body = { role: "resident", name: "  Synthetic saved  ", house: "Fixture", locality: "Fixture", formattedAddress: "Fixture", latitude: 0, longitude: 20, termsAccepted: true };
     assert.equal((await complete(jsonRequest({ ...body, latitude: null }, "POST"))).status, 400);
     assert.equal(f.sql.prepare("SELECT name FROM users WHERE id='resident'").get().name, "");
     assert.equal((await complete(jsonRequest(body, "POST"))).status, 200);

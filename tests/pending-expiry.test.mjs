@@ -7,6 +7,8 @@ import {
   PENDING_EXPIRY_BATCH_LIMIT,
 } from "../app/lib/workflow-integrity.ts";
 
+const fixedNow = "2030-01-07T10:00:00.000Z";
+
 class D1TestAdapter {
   constructor(database) {
     this.database = database;
@@ -87,7 +89,7 @@ function count(database, table, where = "1 = 1") {
 test("bounded expiry is a constant-size no-op when no requests are expired", async () => {
   const { database, d1 } = setup();
   addRequest(database, "future-01", "pending", false);
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(d1.preparedCount, 3);
   assert.equal(count(database, "booking_requests", "status = 'expired'"), 0);
   assert.equal(count(database, "slot_claims"), 1);
@@ -98,11 +100,11 @@ test("fewer than the limit expire atomically and repeated cleanup is idempotent"
   const { database, d1 } = setup();
   for (let index = 0; index < 7; index += 1) addRequest(database, `expired-${index.toString().padStart(2, "0")}`);
   addRequest(database, "future-99", "pending", false);
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(count(database, "booking_requests", "status = 'expired'"), 7);
   assert.equal(count(database, "workflow_transitions"), 7);
   assert.equal(count(database, "slot_claims"), 1);
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(d1.preparedCount, 6);
   assert.equal(count(database, "workflow_transitions"), 7);
   assert.equal(count(database, "slot_claims"), 1);
@@ -112,13 +114,13 @@ test("large backlogs process one deterministic bounded batch per invocation", as
   const { database, d1 } = setup();
   const backlog = PENDING_EXPIRY_BATCH_LIMIT + 9;
   for (let index = 0; index < backlog; index += 1) addRequest(database, `request-${index.toString().padStart(2, "0")}`);
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(d1.preparedCount, 3);
   assert.equal(count(database, "booking_requests", "status = 'expired'"), PENDING_EXPIRY_BATCH_LIMIT);
   assert.equal(count(database, "slot_claims"), 9);
   const remaining = database.prepare("SELECT id FROM booking_requests WHERE status = 'pending' ORDER BY response_due_at, created_at, id").all().map(row => row.id);
   assert.deepEqual(remaining, Array.from({ length: 9 }, (_, offset) => `request-${(PENDING_EXPIRY_BATCH_LIMIT + offset).toString().padStart(2, "0")}`));
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(d1.preparedCount, 6);
   assert.equal(count(database, "booking_requests", "status = 'expired'"), backlog);
   assert.equal(count(database, "slot_claims"), 0);
@@ -133,7 +135,7 @@ test("a request transitioned before the transactional batch is not expired or re
     database.prepare("UPDATE booking_requests SET status = 'accepted' WHERE id = 'accepted-01'").run();
     database.prepare("INSERT INTO workflow_transitions VALUES ('accepted-transition', 'booking_request', 'accepted-01', 'pending', 'accepted', 'helper')").run();
   };
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, fixedNow);
   assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'accepted-01'").get().status, "accepted");
   assert.equal(count(database, "slot_claims", "request_id = 'accepted-01'"), 1);
   assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'expired-02'").get().status, "expired");
@@ -144,7 +146,8 @@ test("a request transitioned before the transactional batch is not expired or re
 test("all statements retain one cutoff when a request deadline passes during the batch", async () => {
   const { database, d1 } = setup();
   addRequest(database, "expired-01");
-  const crossingDeadline = new Date(Date.now() + 1_000).toISOString();
+  const crossingDeadline = "2030-01-07T10:00:01.000Z";
+  let clock = fixedNow;
   database.prepare(
     "INSERT INTO booking_requests VALUES (?, 'pending', ?, ?, ?)",
   ).run("crossing-02", crossingDeadline, "2000-01-01 00:00:02", "2000-01-01 00:00:00");
@@ -155,12 +158,11 @@ test("all statements retain one cutoff when a request deadline passes during the
   d1.beforeStatement = (index, statement) => {
     cutoffs.push(statement.parameters[0]);
     if (index === 1 && !advancedPastDeadline) {
-      const until = new Date(crossingDeadline).getTime() + 20;
-      while (Date.now() < until) { /* advance past the crossing request's deadline */ }
+      clock = "2030-01-07T10:00:01.020Z";
       advancedPastDeadline = true;
     }
   };
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, clock);
 
   assert.equal(new Set(cutoffs).size, 1);
   assert.ok(cutoffs[0] < crossingDeadline);
@@ -171,7 +173,7 @@ test("all statements retain one cutoff when a request deadline passes during the
   assert.equal(count(database, "slot_claims", "request_id = 'crossing-02'"), 1);
   assert.equal(count(database, "workflow_transitions", "entity_id = 'crossing-02'"), 0);
 
-  await expirePendingRequests(d1);
+  await expirePendingRequests(d1, clock);
   assert.equal(database.prepare("SELECT status FROM booking_requests WHERE id = 'crossing-02'").get().status, "expired");
   assert.equal(count(database, "slot_claims", "request_id = 'crossing-02'"), 0);
   assert.equal(count(database, "workflow_transitions", "entity_id = 'crossing-02'"), 1);
