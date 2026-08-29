@@ -3,6 +3,7 @@ import { deriveBookingWorkflowState } from "../../../lib/booking-workflow";
 import { sendPushToUser } from "../../../lib/push";
 import { serviceCompletionAvailableAt } from "../../../lib/service-time";
 import { ELIGIBLE_HELPER_SQL, deadlineInstant, expirePendingRequests, isUniqueConstraintError, transitionGuard } from "../../../lib/workflow-integrity";
+import { loadBusyPeriods } from "../../../lib/helper-busy-periods";
 
 function formatMinute(value: number) {
   return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
@@ -149,10 +150,13 @@ export async function GET(request: Request) {
        WHERE tp.helper_user_id = ? AND tp.status IN ('pending', 'resident_marked_paid', 'review_requested')
        ORDER BY tp.created_at DESC LIMIT 1`,
     ).bind(session.user_id).first<Record<string, string | number | null>>();
+    const busy = await db.prepare("SELECT id,day_of_week,start_minute,end_minute FROM external_busy_periods WHERE helper_user_id=? AND status='active' ORDER BY start_minute,end_minute,day_of_week")
+      .bind(session.user_id).all<{ id: string; day_of_week: number; start_minute: number; end_minute: number }>();
     return Response.json({
       pendingRequest: pending ? await requestDetails(db, pending.id, session.user_id, false) : null,
       activeBooking: activeBookings[0] ?? null,
       activeBookings: activeBookings.filter(Boolean),
+      busyPeriods: loadBusyPeriods(busy.results),
       paymentPending: payment ? {
         id: payment.id,
         amountRupees: Number(payment.amount_paise) / 100,

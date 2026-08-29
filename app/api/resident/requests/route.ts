@@ -224,8 +224,9 @@ export async function POST(request: Request) {
        UNION ALL
        SELECT bs.day_of_week, bs.start_minute, bs.end_minute
        FROM booking_slots bs JOIN bookings b ON b.id = bs.booking_id
-       WHERE b.helper_user_id = ? AND b.status IN ('trial', 'active', 'ending')`,
-    ).bind(helperId, helperId).all<{ day_of_week: number; start_minute: number; end_minute: number }>();
+       WHERE b.helper_user_id = ? AND b.status IN ('trial', 'active', 'ending')
+       UNION ALL SELECT day_of_week,start_minute,end_minute FROM external_busy_periods WHERE helper_user_id=? AND status='active'`,
+    ).bind(helperId, helperId, helperId).all<{ day_of_week: number; start_minute: number; end_minute: number }>();
     const overlaps = requestedSlots.some(slot => busy.results.some(item => item.day_of_week === slot.dayOfWeek
       && slot.start < item.end_minute + 15 && item.start_minute < slot.end + 15));
     if (overlaps) return Response.json({ error: "Another resident has just held this time. Please choose another match." }, { status: 409 });
@@ -270,6 +271,10 @@ export async function POST(request: Request) {
             AND a.day_of_week = json_extract(requested.value, '$.dayOfWeek')
             AND a.start_minute <= json_extract(requested.value, '$.start')
             AND a.end_minute >= json_extract(requested.value, '$.end')
+            AND NOT EXISTS (SELECT 1 FROM external_busy_periods e WHERE e.helper_user_id=a.helper_user_id AND e.status='active'
+              AND e.day_of_week=json_extract(requested.value,'$.dayOfWeek')
+              AND json_extract(requested.value,'$.start')<e.end_minute+15
+              AND e.start_minute<json_extract(requested.value,'$.end')+15)
         )) THEN 'stale_availability' ELSE 'true' END)`)
         .bind(JSON.stringify(requestedSlots), helperId),
       db.prepare(

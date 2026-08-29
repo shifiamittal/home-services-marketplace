@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { fixture } from "./helpers/local-routes.mjs";
+import { png } from "./helpers/proof-images.mjs";
 
 const route = "app/api/helper/address-proof/route.ts";
 function upload() {
   const form = new FormData();
-  form.append("file", new File(["%PDF-1.4\nFixture\n%%EOF"], "fixture.pdf", { type: "application/pdf" }));
-  form.append("documentType", "other_address_proof");
+  form.append("file", new File([png], "fixture.png", { type: "image/png" }));
   return new Request("https://example.test/api", { method: "POST", headers: { origin: "https://example.test" }, body: form });
 }
 
@@ -18,11 +18,11 @@ test("proof upload has no durable operation-ID, staging or cleanup protocol", ()
   const end = page.indexOf("  const saveHelperProfile =", start);
   assert.ok(start >= 0 && end > start);
   const client = page.slice(start, end);
-  assert.deepEqual([...backend.matchAll(/form.get\("([^"]+)"\)/g)].map(match => match[1]), ["file", "documentType"]);
-  assert.deepEqual([...client.matchAll(/form.append\("([^"]+)"/g)].map(match => match[1]), ["file", "documentType"]);
+  assert.deepEqual([...backend.matchAll(/form.get\("([^"]+)"\)/g)].map(match => match[1]), ["file"]);
+  assert.deepEqual([...client.matchAll(/form.append\("([^"]+)"/g)].map(match => match[1]), ["file"]);
   assert.match(backend, /const documentId = crypto.randomUUID\(\)/);
   assert.match(client, /form.append\("file", retry.file\)/);
-  assert.match(client, /proofRetryRef.current = \{ file, documentType: addressProofType \}/);
+  assert.match(client, /proofRetryRef.current = \{ file \}/);
   assert.match(client, /proofRetryRef.current = null/);
   assert.doesNotMatch(client, /localStorage|sessionStorage|indexedDB/);
   assert.doesNotMatch(backend + client, /upload[_-]?id|operation[_-]?id|idempotency|upload_staged|superseded_cleaned|staging|proof_cleanup/i);

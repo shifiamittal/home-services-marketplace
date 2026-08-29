@@ -1,8 +1,6 @@
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 import { validateAddressProof } from "../../../lib/upload-security";
 
-const acceptedDocuments = new Set(["aadhaar", "voter_id", "other_address_proof"]);
-
 export async function POST(request: Request) {
   try {
     assertSameOrigin(request);
@@ -15,24 +13,22 @@ export async function POST(request: Request) {
 
     const form = await request.formData();
     const file = form.get("file");
-    const documentType = form.get("documentType");
+    // Retain the required legacy schema column without asking for classification.
+    const documentType = "other_address_proof";
     if (!(file instanceof File) || file.size < 1 || file.size > 5 * 1024 * 1024) {
-      return Response.json({ error: "Upload a clear JPG, PNG or PDF smaller than 5 MB." }, { status: 400 });
-    }
-    if (typeof documentType !== "string" || !acceptedDocuments.has(documentType)) {
-      return Response.json({ error: "Choose the type of address proof." }, { status: 400 });
+      return Response.json({ error: "Upload a clear JPEG or PNG image no larger than 5 MB." }, { status: 400 });
     }
 
     const db = await getD1();
     const existing = await db.prepare(
-      "SELECT id, r2_object_key FROM verification_documents WHERE helper_user_id = ? AND status != 'deleted'",
-    ).bind(session.user_id).all<{ id: string; r2_object_key: string }>();
+      "SELECT id, r2_object_key, status FROM verification_documents WHERE helper_user_id = ? AND status != 'deleted'",
+    ).bind(session.user_id).all<{ id: string; r2_object_key: string; status: string }>();
     const bytes = new Uint8Array(await file.arrayBuffer());
     let validated: ReturnType<typeof validateAddressProof>;
     try {
       validated = validateAddressProof(file.name, file.type, bytes);
     } catch {
-      return Response.json({ error: "This file is not a structurally valid JPG, PNG or safe PDF." }, { status: 400 });
+      return Response.json({ error: "Upload a valid JPEG or PNG image with a matching filename extension and file type." }, { status: 400 });
     }
     const documentId = crypto.randomUUID();
     const objectKey = `private/address-proofs/${session.user_id}/${documentId}.${validated.extension}`;
@@ -41,6 +37,22 @@ export async function POST(request: Request) {
       customMetadata: { ownerUserId: session.user_id, documentType },
     });
     await db.batch([
+      // Recheck eligibility, ownership and the complete expected current set
+      // before any D1 mutation. A competing replacement/review must retry.
+      db.prepare(
+        `SELECT CASE WHEN EXISTS (
+           SELECT 1 FROM users u JOIN user_roles ur ON ur.user_id = u.id
+           WHERE u.id = ? AND u.status = 'active' AND ur.role = 'helper'
+         ) AND (SELECT count(*) FROM verification_documents WHERE helper_user_id = ? AND status != 'deleted') = json_array_length(?)
+         AND NOT EXISTS (
+           SELECT 1 FROM json_each(?) expected WHERE NOT EXISTS (
+             SELECT 1 FROM verification_documents vd WHERE vd.helper_user_id = ?
+               AND vd.id = json_extract(expected.value, '$.id')
+               AND vd.r2_object_key = json_extract(expected.value, '$.r2_object_key')
+               AND vd.status = json_extract(expected.value, '$.status') AND vd.status != 'deleted'
+           )
+         ) THEN 1 ELSE abs(-9223372036854775808) END`,
+      ).bind(session.user_id, session.user_id, JSON.stringify(existing.results), JSON.stringify(existing.results), session.user_id),
       db.prepare(
         `INSERT INTO helper_profiles (user_id, home_locality, verification_status, profile_status)
          VALUES (?, '', 'pending', 'draft')
@@ -60,6 +72,9 @@ export async function POST(request: Request) {
     return Response.json({ uploaded: true, filename: validated.filename, status: "provided" });
   } catch (error) {
     if (error instanceof Response) return error;
+    if (error instanceof Error && error.message.includes("integer overflow")) {
+      return Response.json({ error: "We could not save your changes. Refresh and try again." }, { status: 409 });
+    }
     return Response.json({ error: "We could not upload the address proof. Please try again." }, { status: 500 });
   }
 }

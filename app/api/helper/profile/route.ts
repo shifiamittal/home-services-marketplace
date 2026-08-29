@@ -1,11 +1,14 @@
-import { coordinates, effectiveLocationText, effectiveLocationTextSql, storedCoordinates } from "../../../lib/address-integrity";
+import { coordinates, effectiveLocationText, storedCoordinates } from "../../../lib/address-integrity";
 import { assertSameOrigin, getD1, getSession } from "../../../lib/auth";
 
 import { fieldError, profileFailure } from "../../../lib/profile-errors";
+import { exactDays, loadSchedule, minuteOfDay, scheduleWriteGuard, validWindow, type StoredWindow } from "../../../lib/helper-schedule";
+import { helperAddressExpressions, saveAddressVerification } from "../../../lib/helper-address-verification";
 import { saveAvailability } from "../../../lib/profile-availability";
-
-type ServiceKey = "house_cleaning" | "utensils_once" | "utensils_twice";
-type HomeSize = "one_two_bhk" | "three_bhk" | "four_plus_bhk" | "not_applicable";
+import { formattedHelperAddress, parseHelperAddress, type HelperAddress } from "../../../lib/helper-address";
+import { helperAddressState, meaningfulLegacyHelperAddressSql, storedStructuredHelperAddress } from "../../../lib/helper-address-state";
+import { parseLegacyOfferings, parseServices, servicesResponse, type OfferingRow } from "../../../lib/helper-offerings";
+import { loadBusyPeriods, parseBusyPeriods, saveBusyPeriods, type BusyPeriod } from "../../../lib/helper-busy-periods";
 type DayPattern = "mon_sat" | "mon_fri" | "every_day";
 
 const patternDays: Record<DayPattern, number[]> = {
@@ -13,16 +16,6 @@ const patternDays: Record<DayPattern, number[]> = {
   mon_fri: [1, 2, 3, 4, 5],
   every_day: [0, 1, 2, 3, 4, 5, 6],
 };
-
-function minuteOfDay(value: unknown) {
-  if (typeof value !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) return -1;
-  const [hours, minutes] = value.split(":").map(Number);
-  return hours * 60 + minutes;
-}
-
-function formatMinute(value: number) {
-  return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
-}
 
 async function requireHelper(request: Request) {
   const session = await getSession(request);
@@ -36,19 +29,23 @@ export async function GET(request: Request) {
     const session = await requireHelper(request);
     const db = await getD1();
     const profile = await db.prepare(
-      `SELECT home_locality, home_address, latitude_e6, longitude_e6, max_travel_distance_meters,
+      `SELECT home_locality, home_address, house_or_flat, floor, building_or_society, city, state, pin_code,
+              latitude_e6, longitude_e6, max_travel_distance_meters,
               landmark, years_experience, verification_status, profile_status
        FROM helper_profiles WHERE user_id = ? LIMIT 1`,
     ).bind(session.user_id).first<Record<string, string | number>>();
     const offerings = await db.prepare(
       `SELECT service_type, home_size, monthly_price_paise, is_active
        FROM helper_offerings WHERE helper_user_id = ? ORDER BY service_type, home_size`,
-    ).bind(session.user_id).all<Record<string, string | number>>();
+    ).bind(session.user_id).all<{ service_type: string; home_size: string; monthly_price_paise: number; is_active: number }>();
     const slots = await db.prepare(
-      `SELECT source_group_id, day_pattern, start_minute, end_minute
+      `SELECT day_of_week, start_minute, end_minute
        FROM availability_slots WHERE helper_user_id = ? AND status = 'open'
        ORDER BY created_at, day_of_week`,
-    ).bind(session.user_id).all<{ source_group_id: string | null; day_pattern: DayPattern | null; start_minute: number; end_minute: number }>();
+    ).bind(session.user_id).all<StoredWindow>();
+    const busy = await db.prepare(`SELECT id,day_of_week,start_minute,end_minute FROM external_busy_periods
+      WHERE helper_user_id=? AND status='active' ORDER BY start_minute,end_minute,day_of_week`).bind(session.user_id)
+      .all<{ id: string; day_of_week: number; start_minute: number; end_minute: number }>();
     const document = await db.prepare(
       `SELECT original_filename, document_type, status, created_at
        FROM verification_documents
@@ -56,23 +53,21 @@ export async function GET(request: Request) {
        ORDER BY CASE WHEN status IN ('pending', 'verified') THEN 0 ELSE 1 END, created_at DESC, id LIMIT 1`,
     ).bind(session.user_id).first<Record<string, string>>();
 
-    const grouped = new Map<string, { id: string; days: DayPattern; start: string; end: string }>();
-    for (const slot of slots.results) {
-      const id = slot.source_group_id || crypto.randomUUID();
-      if (!grouped.has(id)) grouped.set(id, {
-        id,
-        days: slot.day_pattern || "mon_sat",
-        start: formatMinute(slot.start_minute),
-        end: formatMinute(slot.end_minute),
-      });
-    }
+    const schedule = loadSchedule(slots.results);
 
     const point = profile ? storedCoordinates(profile.latitude_e6, profile.longitude_e6) : null;
+    const addressState = profile ? helperAddressState(profile) : "none";
+    const structuredAddress = profile && addressState === "structured" ? storedStructuredHelperAddress(profile) : null;
+    const legacyAddress = profile && addressState === "legacy" ? effectiveLocationText(profile.home_address, profile.home_locality) : null;
+    const serviceState = servicesResponse(offerings.results);
     return Response.json({
       exists: Boolean(profile),
       profile: profile ? {
         locality: profile.home_locality,
         homeAddress: effectiveLocationText(profile.home_address, null),
+        addressState,
+        address: structuredAddress,
+        legacyAddress,
         latitude: point?.latitude == null ? null : point.latitude / 1_000_000,
         longitude: point?.longitude == null ? null : point.longitude / 1_000_000,
         travelDistanceKm: typeof profile.max_travel_distance_meters === "number" ? profile.max_travel_distance_meters / 1_000 : null,
@@ -82,7 +77,10 @@ export async function GET(request: Request) {
         profileStatus: profile.profile_status,
       } : null,
       offerings: offerings.results,
-      availability: [...grouped.values()],
+      ...serviceState,
+      availability: schedule.kind === "common" ? schedule.windows : [],
+      schedule,
+      busyPeriods: loadBusyPeriods(busy.results),
       addressProof: document ? {
         filename: document.original_filename,
         documentType: document.document_type,
@@ -97,6 +95,7 @@ export async function GET(request: Request) {
 }
 
 export async function PUT(request: Request) {
+  let updatingBusyPeriods = false;
   try {
     assertSameOrigin(request);
     const session = await requireHelper(request);
@@ -108,19 +107,38 @@ export async function PUT(request: Request) {
       travelDistanceKm?: unknown;
       yearsExperience?: unknown;
       offerings?: unknown;
+      services?: unknown;
       availability?: unknown;
+      replaceSchedule?: unknown;
+      address?: unknown;
+      preserveAddress?: unknown;
+      busyPeriods?: unknown;
     };
     if (!body || typeof body !== "object" || Array.isArray(body)) return fieldError("profile", "Provide a valid profile.");
-    const locality = typeof body.locality === "string" ? body.locality.trim() : "";
-    const homeAddress = typeof body.homeAddress === "string" ? body.homeAddress.trim() : "";
+    if (body.preserveAddress !== undefined && typeof body.preserveAddress !== "boolean") return fieldError("address", "Choose whether to keep your saved address.");
+    const preserveAddress = body.preserveAddress === true;
+    const writeStructuredAddress = body.address !== undefined;
+    if (preserveAddress && writeStructuredAddress) return fieldError("address", "Choose either your saved address or a corrected address.");
+    let structuredAddress: HelperAddress | null = null;
+    let locality = "", homeAddress = "";
+    if (writeStructuredAddress) {
+      try { structuredAddress = parseHelperAddress(body.address); }
+      catch (error) { return fieldError("address", error instanceof Error ? error.message : "Enter a valid address."); }
+      locality = structuredAddress.city;
+      homeAddress = formattedHelperAddress(structuredAddress);
+    } else if (!preserveAddress) {
+      // Compatibility for clients and records created before structured helper addresses.
+      locality = typeof body.locality === "string" ? body.locality.trim() : "";
+      homeAddress = typeof body.homeAddress === "string" ? body.homeAddress.trim() : "";
+    }
     let point;
-    try { point = coordinates(body.latitude, body.longitude); }
+    try { point = preserveAddress ? { latitude: null, longitude: null } : coordinates(body.latitude, body.longitude); }
     catch { return fieldError("address", "Choose a valid address location."); }
-    const omittedCoordinates = body.latitude === undefined && body.longitude === undefined;
+    const omittedCoordinates = !preserveAddress && body.latitude === undefined && body.longitude === undefined;
     const travelDistanceKm = Number(body.travelDistanceKm);
     const yearsExperience = Number(body.yearsExperience);
-    if (!locality || locality.length > 160 || !homeAddress || homeAddress.length > 300) {
-      return fieldError("address", "Choose your starting address from Google suggestions.");
+    if (!preserveAddress && (!locality || locality.length > 160 || !homeAddress || homeAddress.length > 500)) {
+      return fieldError("address", "Enter your required address details.");
     }
     if (!Number.isFinite(travelDistanceKm) || travelDistanceKm <= 0 || travelDistanceKm > 500) {
       return fieldError("travelDistanceKm", "Enter an approximate travel distance in kilometres.");
@@ -129,52 +147,44 @@ export async function PUT(request: Request) {
       return fieldError("yearsExperience", "Enter valid years of experience.");
     }
 
-    const rawOfferings = Array.isArray(body.offerings) ? body.offerings : [];
-    const offerings: Array<{ serviceType: ServiceKey; homeSize: HomeSize; monthlyPricePaise: number }> = [];
-    const offeringKeys = new Set<string>();
-    for (const item of rawOfferings) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return fieldError("offerings", "Choose valid service prices.");
-      const value = item as Record<string, unknown>;
-      const serviceType = value.serviceType as ServiceKey;
-      const homeSize = value.homeSize as HomeSize;
-      const monthlyPriceRupees = Number(value.monthlyPriceRupees);
-      const validService = ["house_cleaning", "utensils_once", "utensils_twice"].includes(serviceType);
-      const validHomeSize = serviceType === "house_cleaning"
-        ? ["one_two_bhk", "three_bhk", "four_plus_bhk"].includes(homeSize)
-        : homeSize === "not_applicable";
-      if (!validService || !validHomeSize || !Number.isInteger(monthlyPriceRupees) || monthlyPriceRupees < 100 || monthlyPriceRupees > 100_000) {
-        return fieldError("offerings", "Enter a valid monthly price for every selected service.");
+    const updateServices = body.services !== undefined || body.offerings !== undefined;
+    let offerings: OfferingRow[] = [];
+    if (updateServices) {
+      try {
+        offerings = body.services !== undefined ? parseServices(body.services) : parseLegacyOfferings(body.offerings);
+      } catch (error) {
+        return fieldError("offerings", error instanceof Error ? error.message : "Choose valid service prices.");
       }
-      const key = `${serviceType}:${homeSize}`;
-      if (offeringKeys.has(key)) return fieldError("offerings", "A service price was entered more than once.");
-      offeringKeys.add(key);
-      offerings.push({ serviceType, homeSize, monthlyPricePaise: monthlyPriceRupees * 100 });
+    } else {
+      const existing = await (await getD1()).prepare(
+        "SELECT service_type, home_size, monthly_price_paise FROM helper_offerings WHERE helper_user_id = ? AND is_active = 1",
+      ).bind(session.user_id).all<Record<string, string | number>>();
+      if (!existing.results.length) return fieldError("offerings", "Select at least one service.");
     }
-    if (!offerings.length) return fieldError("offerings", "Select at least one service.");
 
+    const preserveSchedule = body.availability === undefined;
+    const replaceSchedule = body.replaceSchedule === true;
+    if (body.replaceSchedule !== undefined && typeof body.replaceSchedule !== "boolean") return fieldError("availability", "Confirm whether to replace your schedule.");
+    if (!preserveSchedule && !Array.isArray(body.availability)) return fieldError("availability", "Choose valid working days and hours.");
     const rawAvailability = Array.isArray(body.availability) ? body.availability : [];
-    if (rawAvailability.length > 28) return fieldError("availability", "Use at most 28 recurring windows.");
-    const availability: Array<{ id: string; pattern: DayPattern; start: number; end: number }> = [];
+    const availability: Array<{ days: number[]; pattern: string | null; start: number; end: number }> = [];
     for (const item of rawAvailability) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) return fieldError("availability", "Choose valid recurring windows.");
+      if (!item || typeof item !== "object" || Array.isArray(item)) return fieldError("availability", "Choose valid working days and hours.");
       const value = item as Record<string, unknown>;
-      const pattern = value.days as DayPattern;
-      const start = minuteOfDay(value.start);
-      const end = minuteOfDay(value.end);
-      if (!Object.hasOwn(patternDays, pattern) || start < 0 || end < 0 || end - start < 30) {
-        return fieldError("availability", "Each available time must be at least 30 minutes and end after it starts.");
-      }
-      availability.push({ id: crypto.randomUUID(), pattern, start, end });
+      const explicitPattern = typeof value.days === "string" && Object.hasOwn(patternDays, value.days) ? value.days as DayPattern : null;
+      let days: number[];
+      try { days = exactDays(explicitPattern ? patternDays[explicitPattern] : value.days); }
+      catch { return fieldError("availability", "Select at least one valid weekday."); }
+      const start = minuteOfDay(value.start), end = minuteOfDay(value.end);
+      if (!validWindow({ day_of_week: days[0], start_minute: start, end_minute: end })) return fieldError("availability", "Use same-day working hours on the 15-minute grid, ending after the start.");
+      availability.push({ days, pattern: explicitPattern, start, end });
     }
-    if (!availability.length) return fieldError("availability", "Add at least one available time.");
-
-    for (let first = 0; first < availability.length; first += 1) {
-      for (let second = first + 1; second < availability.length; second += 1) {
-        const sharesDay = patternDays[availability[first].pattern].some(day => patternDays[availability[second].pattern].includes(day));
-        if (sharesDay && availability[first].start < availability[second].end + 15 && availability[second].start < availability[first].end + 15) {
-          return fieldError("availability", "Available times on the same day need a 15-minute travel buffer.");
-        }
-      }
+    if (!preserveSchedule && availability.length !== 1) return fieldError("availability", "Select one common working-hours range for your selected days.");
+    updatingBusyPeriods = body.busyPeriods !== undefined;
+    let busyPeriods: BusyPeriod[] = [];
+    if (updatingBusyPeriods) {
+      try { busyPeriods = parseBusyPeriods(body.busyPeriods); }
+      catch (error) { return fieldError("busyPeriods", error instanceof Error ? error.message : "Add valid recurring busy periods."); }
     }
 
     const db = await getD1();
@@ -186,47 +196,75 @@ export async function PUT(request: Request) {
     if (!addressProof) {
       return fieldError("addressProof", "Upload a valid address-proof document before publishing your profile.", 409);
     }
+    const address = helperAddressExpressions("helper_profiles", "excluded", "?", "?");
     const statements = [
+      // This is the first operation INSIDE the atomic batch. SQLite CASE
+      // evaluates only the selected branch; abs(INT64_MIN) deliberately aborts
+      // ineligible saves with an integer-overflow error, distinct from the
+      // existing JSON-based commitment guards. No earlier read can authorize it.
+      db.prepare(`SELECT CASE WHEN EXISTS (
+        SELECT 1 FROM users WHERE id = ? AND status = 'active'
+      ) AND (NOT ? OR EXISTS (
+        SELECT 1 FROM helper_profiles hp WHERE hp.user_id = ? AND ${meaningfulLegacyHelperAddressSql("hp")}
+      )
+      ) THEN 1 ELSE abs(-9223372036854775808) END`).bind(session.user_id, Number(preserveAddress), session.user_id),
+      ...saveAddressVerification(db, session.user_id, { locality, homeAddress, ...point, omittedCoordinates, preserveAddress },
+        JSON.stringify({ offeringCount: updateServices ? offerings.length : null, availabilityGroupCount: availability.length, travelDistanceKm })),
       db.prepare(
         `INSERT INTO helper_profiles
-           (user_id, home_locality, home_address, latitude_e6, longitude_e6, max_travel_distance_meters, years_experience, profile_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
-         ON CONFLICT(user_id) DO UPDATE SET home_locality = excluded.home_locality, home_address = excluded.home_address,
-         latitude_e6 = CASE WHEN ? AND ${effectiveLocationTextSql('helper_profiles.home_address', 'NULL')} = excluded.home_address
-           AND ${effectiveLocationTextSql('helper_profiles.home_locality', 'NULL')} = excluded.home_locality
-           AND typeof(helper_profiles.latitude_e6) = 'integer' AND typeof(helper_profiles.longitude_e6) = 'integer'
-           AND helper_profiles.latitude_e6 BETWEEN -90000000 AND 90000000 AND helper_profiles.longitude_e6 BETWEEN -180000000 AND 180000000
-           AND (helper_profiles.latitude_e6 != 0 OR helper_profiles.longitude_e6 != 0)
-           THEN helper_profiles.latitude_e6 ELSE excluded.latitude_e6 END,
-         longitude_e6 = CASE WHEN ? AND ${effectiveLocationTextSql('helper_profiles.home_address', 'NULL')} = excluded.home_address
-           AND ${effectiveLocationTextSql('helper_profiles.home_locality', 'NULL')} = excluded.home_locality
-           AND typeof(helper_profiles.latitude_e6) = 'integer' AND typeof(helper_profiles.longitude_e6) = 'integer'
-           AND helper_profiles.latitude_e6 BETWEEN -90000000 AND 90000000 AND helper_profiles.longitude_e6 BETWEEN -180000000 AND 180000000
-           AND (helper_profiles.latitude_e6 != 0 OR helper_profiles.longitude_e6 != 0)
-           THEN helper_profiles.longitude_e6 ELSE excluded.longitude_e6 END,
+           (user_id, home_locality, home_address, house_or_flat, floor, building_or_society, city, state, pin_code,
+            latitude_e6, longitude_e6, max_travel_distance_meters, years_experience, profile_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+         ON CONFLICT(user_id) DO UPDATE SET
+         home_locality = CASE WHEN ? THEN helper_profiles.home_locality ELSE excluded.home_locality END,
+         home_address = CASE WHEN ? THEN helper_profiles.home_address ELSE excluded.home_address END,
+         house_or_flat = CASE WHEN ? THEN helper_profiles.house_or_flat ELSE excluded.house_or_flat END,
+         floor = CASE WHEN ? THEN helper_profiles.floor ELSE excluded.floor END,
+         building_or_society = CASE WHEN ? THEN helper_profiles.building_or_society ELSE excluded.building_or_society END,
+         city = CASE WHEN ? THEN helper_profiles.city ELSE excluded.city END,
+         state = CASE WHEN ? THEN helper_profiles.state ELSE excluded.state END,
+         pin_code = CASE WHEN ? THEN helper_profiles.pin_code ELSE excluded.pin_code END,
+         latitude_e6 = ${address.latitude}, longitude_e6 = ${address.longitude},
          max_travel_distance_meters = excluded.max_travel_distance_meters, years_experience = excluded.years_experience,
          profile_status = CASE WHEN helper_profiles.profile_status IN ('draft', 'active')
            THEN 'active' ELSE helper_profiles.profile_status END, updated_at = CURRENT_TIMESTAMP`,
-      ).bind(session.user_id, locality, homeAddress, point.latitude, point.longitude, Math.round(travelDistanceKm * 1_000), yearsExperience, Number(omittedCoordinates), Number(omittedCoordinates)),
-      db.prepare("DELETE FROM helper_offerings WHERE helper_user_id = ?").bind(session.user_id),
-      ...saveAvailability(db, session.user_id, availability.flatMap(group => patternDays[group.pattern].map(day => ({ day, start: group.start, end: group.end, pattern: group.pattern })))),
+      ).bind(session.user_id, locality, homeAddress,
+        structuredAddress?.houseOrFlat ?? null, structuredAddress?.floor ?? null, structuredAddress?.buildingOrSociety ?? null,
+        structuredAddress?.city ?? null, structuredAddress?.state ?? null, structuredAddress?.pinCode ?? null,
+        point.latitude, point.longitude, Math.round(travelDistanceKm * 1_000), yearsExperience,
+        Number(preserveAddress), Number(preserveAddress),
+        ...Array(6).fill(Number(preserveAddress)),
+        Number(preserveAddress), Number(omittedCoordinates), Number(preserveAddress), Number(omittedCoordinates)),
+      scheduleWriteGuard(db, session.user_id, preserveSchedule, replaceSchedule),
+      ...(preserveSchedule ? [] : saveAvailability(db, session.user_id, availability.flatMap(group => group.days.map(day => ({ day, start: group.start, end: group.end, pattern: group.pattern }))))),
+      ...(updatingBusyPeriods ? saveBusyPeriods(db, session.user_id, busyPeriods) : []),
+      ...(updateServices ? [
+        db.prepare("UPDATE helper_offerings SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE helper_user_id = ? AND is_active = 1").bind(session.user_id),
+      ] : []),
     ];
-    for (const offering of offerings) {
+    for (const offering of updateServices ? offerings : []) {
       statements.push(db.prepare(
         `INSERT INTO helper_offerings (id, helper_user_id, service_type, home_size, monthly_price_paise, is_active)
-         VALUES (?, ?, ?, ?, ?, 1)`,
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON CONFLICT(helper_user_id, service_type, home_size) DO UPDATE SET
+           monthly_price_paise = excluded.monthly_price_paise, is_active = 1, updated_at = CURRENT_TIMESTAMP`,
       ).bind(crypto.randomUUID(), session.user_id, offering.serviceType, offering.homeSize, offering.monthlyPricePaise));
     }
-    statements.push(db.prepare(
-      "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'helper_profile_saved', ?)",
-    ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ offeringCount: offerings.length, availabilityGroupCount: availability.length, travelDistanceKm })));
-    await db.batch(statements);
-    const saved = await db.prepare("SELECT profile_status FROM helper_profiles WHERE user_id = ?").bind(session.user_id).first<{ profile_status: string }>();
-    return Response.json({ saved: true, profileStatus: saved?.profile_status, combinedPricesCalculated: true });
+    // Read the authoritative response state inside the save transaction. If
+    // this read fails, the profile and audit roll back together; after commit
+    // constructing the response needs no further database operation.
+    statements.push(db.prepare("SELECT profile_status,verification_status FROM helper_profiles WHERE user_id = ?").bind(session.user_id));
+    const results = await db.batch<{ profile_status: string; verification_status: string }>(statements);
+    const saved = results[results.length - 1].results[0];
+    return Response.json({ saved: true, profileStatus: saved.profile_status, verificationStatus: saved.verification_status, combinedPricesCalculated: true });
   } catch (error) {
     if (error instanceof Response) return error;
+    if (error instanceof Error && error.message.includes("integer overflow")) {
+      return Response.json({ error: "Your account cannot save changes right now. Refresh and try again." }, { status: 409 });
+    }
     if (error instanceof Error && error.message.includes("malformed JSON")) {
-      return fieldError("availability", "These hours would exclude a pending request or booked service. Keep its time available.", 409);
+      if (updatingBusyPeriods) return fieldError("busyPeriods", "Keep busy periods inside working hours and clear of pending requests or live bookings.", 409);
+      return fieldError("availability", "Keep pending and booked service times covered. Legacy schedules need explicit replacement confirmation; otherwise leave the schedule unchanged.", 409);
     }
     return profileFailure("profile_save");
   }
@@ -240,16 +278,27 @@ export async function PATCH(request: Request) {
     if (typeof body.paused !== "boolean") return Response.json({ error: "Choose whether your profile is active." }, { status: 400 });
     const db = await getD1();
     const nextStatus = body.paused ? "paused" : "active";
-    const result = await db.prepare(
-      "UPDATE helper_profiles SET profile_status = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND profile_status IN ('active', 'paused')",
-    ).bind(nextStatus, session.user_id).run();
-    if (!result.meta.changes) return Response.json({ error: "Complete your work profile before changing availability." }, { status: 409 });
-    await db.prepare(
-      "INSERT INTO analytics_events (id, user_id, event_name, properties_json) VALUES (?, ?, 'helper_profile_status_changed', ?)",
-    ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ profileStatus: nextStatus })).run();
+    const previousStatus = body.paused ? "active" : "paused";
+    // Both the transition guard and its audit run inside the same transaction.
+    // changes() belongs to the immediately preceding guarded UPDATE: a stale
+    // transition cannot insert an audit record, and either write failing rolls
+    // back the entire batch. RETURNING avoids a racy post-commit status read.
+    const [transition] = await db.batch<{ profile_status: string }>([
+      db.prepare(
+        `UPDATE helper_profiles SET profile_status = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE user_id = ? AND profile_status = ?
+           AND EXISTS (SELECT 1 FROM users WHERE id = ? AND status = 'active')
+         RETURNING profile_status`,
+      ).bind(nextStatus, session.user_id, previousStatus, session.user_id),
+      db.prepare(
+        `INSERT INTO analytics_events (id, user_id, event_name, properties_json)
+         SELECT ?, ?, 'helper_profile_status_changed', ? WHERE changes() = 1`,
+      ).bind(crypto.randomUUID(), session.user_id, JSON.stringify({ profileStatus: nextStatus })),
+    ]);
+    if (!transition.results.length) return Response.json({ error: "Your profile status changed or cannot be edited. Refresh and try again." }, { status: 409 });
     return Response.json({ saved: true, profileStatus: nextStatus });
   } catch (error) {
     if (error instanceof Response) return error;
-    return Response.json({ error: "We could not update your profile availability." }, { status: 500 });
+    return profileFailure("profile_status");
   }
 }

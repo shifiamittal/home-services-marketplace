@@ -193,7 +193,9 @@ export async function POST(request: Request) {
          UNION ALL
          SELECT b.helper_user_id, bs.day_of_week, bs.start_minute, bs.end_minute
          FROM booking_slots bs JOIN bookings b ON b.id = bs.booking_id
-         WHERE b.status IN ('trial', 'active', 'ending')`,
+         WHERE b.status IN ('trial', 'active', 'ending')
+         UNION ALL
+         SELECT helper_user_id,day_of_week,start_minute,end_minute FROM external_busy_periods WHERE status='active'`,
       ).all<BusyRow>(),
       db.prepare(`SELECT sc.helper_user_id, sc.day_of_week, sc.minute_of_day
         FROM slot_claims sc JOIN booking_requests br ON br.id = sc.request_id

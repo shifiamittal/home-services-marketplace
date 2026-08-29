@@ -55,6 +55,12 @@ export const helperProfiles = sqliteTable("helper_profiles", {
   homeLocality: text("home_locality").notNull(),
   homeAddress: text("home_address"),
   landmark: text("landmark"),
+  houseOrFlat: text("house_or_flat"),
+  floor: text("floor"),
+  buildingOrSociety: text("building_or_society"),
+  city: text("city"),
+  state: text("state"),
+  pinCode: text("pin_code"),
   latitude: integer("latitude_e6"),
   longitude: integer("longitude_e6"),
   maxTravelDistanceMeters: integer("max_travel_distance_meters"),
@@ -101,6 +107,16 @@ export const availabilitySlots = sqliteTable("availability_slots", {
   status: text("status", { enum: ["open", "held", "booked", "inactive"] }).notNull().default("open"),
   ...timestamps,
 }, table => [index("availability_slots_helper_day_idx").on(table.helperUserId, table.dayOfWeek), index("availability_slots_group_idx").on(table.helperUserId, table.sourceGroupId)]);
+
+export const externalBusyPeriods = sqliteTable("external_busy_periods", {
+  id: text("id").primaryKey(),
+  helperUserId: text("helper_user_id").notNull().references(() => users.id),
+  dayOfWeek: integer("day_of_week").notNull(),
+  startMinute: integer("start_minute").notNull(),
+  endMinute: integer("end_minute").notNull(),
+  status: text("status", { enum: ["active", "inactive"] }).notNull().default("active"),
+  ...timestamps,
+}, table => [index("external_busy_periods_helper_day_idx").on(table.helperUserId, table.dayOfWeek, table.status)]);
 
 export const bookingRequests = sqliteTable("booking_requests", {
   id: text("id").primaryKey(),

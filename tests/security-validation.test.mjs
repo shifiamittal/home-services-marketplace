@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { png } from "./helpers/proof-images.mjs";
 
 import { validateAndroidPushSubscription } from "../app/lib/push-subscription.ts";
 import { sanitizeUploadFilename, validateAddressProof } from "../app/lib/upload-security.ts";
@@ -28,17 +29,11 @@ test("push subscription route contract rejects unsafe and unsupported endpoints"
 });
 
 test("address-proof validation accepts structured PNG and rejects MIME spoofing and active content", () => {
-  const png = Uint8Array.from([
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52,
-    0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-  ]);
   assert.equal(validateAddressProof("../proof?.png", "image/png", png).filename, "proof-.png");
   assert.throws(() => validateAddressProof("proof.jpg", "image/jpeg", png), /mime_mismatch/);
   assert.throws(() => validateAddressProof("proof.jpg", "image/jpeg", new TextEncoder().encode("<script>alert(1)</script>")));
 });
 
 test("address-proof filenames are reduced to a safe leaf name and actual extension", () => {
-  assert.equal(sanitizeUploadFilename("../../My Aadhaar<script>.exe", "pdf"), "My Aadhaar-script-.pdf");
+  assert.equal(sanitizeUploadFilename("../../My Aadhaar<script>.exe", "png"), "My Aadhaar-script-.png");
 });
