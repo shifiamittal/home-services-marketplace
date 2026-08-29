@@ -32,6 +32,7 @@ jobs:
     environment: production
     env:
       EXPECTED_ACCOUNT_ID: 0c53a1d6277d240fe99359ce0495fe9d
+      EXPECTED_WORKER_NAME: nivasa-home-help
       EXPECTED_DATABASE_ID: 508b580c-9da0-41ad-97d2-4695047eb2b0
       EXPECTED_DATABASE_NAME: nivasa-production
       EXPECTED_BUCKET_NAME: nivasa-private-address-proofs
@@ -69,9 +70,15 @@ jobs:
 
       - name: Validate production configuration and reviewed migrations
         run: |
-          node --input-type=commonjs <<'NODE'
-          const fs = require('node:fs');
-          const crypto = require('node:crypto');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {
+            ORDERED_MIGRATION_NAMES,
+            expectedSchemaManifest,
+            validateProductionConfiguration,
+            validateRepositoryMigrations,
+          } from './scripts/production-migration-contract.mjs';
           function stripJsonComments(source) {
             let output = '';
             let inString = false;
@@ -108,104 +115,25 @@ jobs:
 
           const configSource = fs.readFileSync('wrangler.jsonc', 'utf8');
           const config = JSON.parse(stripJsonComments(configSource));
-          const database = config.d1_databases?.find((item) => item.binding === 'DB');
-          const bucket = config.r2_buckets?.find((item) => item.binding === 'BUCKET');
-          const expected = process.env;
-
-          const checks = [
-            [config.account_id, expected.EXPECTED_ACCOUNT_ID, 'account ID'],
-            [database?.database_id, expected.EXPECTED_DATABASE_ID, 'D1 database ID'],
-            [database?.database_name, expected.EXPECTED_DATABASE_NAME, 'D1 database name'],
-            [database?.migrations_dir, './drizzle', 'D1 migrations directory'],
-            [bucket?.bucket_name, expected.EXPECTED_BUCKET_NAME, 'R2 bucket name'],
-            [config.workers_dev, false, 'Workers.dev setting'],
-            [config.preview_urls, false, 'preview URL setting'],
-          ];
-          for (const [actual, wanted, label] of checks) {
-            if (actual !== wanted) throw new Error(`Unexpected ${label}`);
-          }
+          validateProductionConfiguration(config, {
+            workerName: process.env.EXPECTED_WORKER_NAME,
+            accountId: process.env.EXPECTED_ACCOUNT_ID,
+            databaseId: process.env.EXPECTED_DATABASE_ID,
+            databaseName: process.env.EXPECTED_DATABASE_NAME,
+            bucketName: process.env.EXPECTED_BUCKET_NAME,
+          });
           console.log('Production resource configuration matches the reviewed values.');
 
-          const migrations = [
-            '0000_wet_obadiah_stane.sql',
-            '0001_spooky_freak.sql',
-            '0002_tired_manta.sql',
-            '0003_lyrical_iron_monger.sql',
-            '0004_puzzling_tag.sql',
-            '0005_optimal_newton_destine.sql',
-            '0006_oval_ultimates.sql',
-            '0007_strange_calypso.sql',
-            '0008_wealthy_lady_deathstrike.sql',
-            '0009_unusual_black_cat.sql',
-            '0010_lonely_boom_boom.sql',
-          ];
-          const tables = [
-            'analytics_events', 'availability_slots', 'booking_cancellations',
-            'booking_requests', 'booking_slots', 'booking_status_history', 'bookings',
-            'consents', 'helper_offerings', 'helper_profiles', 'issue_case_counter',
-            'issue_status_history', 'issues', 'notification_log', 'push_subscriptions',
-            'request_slots', 'resident_addresses', 'resident_profiles', 'reviews',
-            'service_visits', 'sessions', 'slot_claims', 'trial_payments', 'user_roles',
-            'users', 'verification_documents', 'workflow_transitions',
-          ];
-          const indexes = [
-            'analytics_events_name_time_idx', 'analytics_events_user_time_idx',
-            'availability_slots_group_idx', 'availability_slots_helper_day_idx',
-            'booking_cancellations_booking_unique', 'booking_requests_helper_idx',
-            'booking_requests_one_pending_per_resident', 'booking_requests_resident_idx',
-            'booking_slots_booking_idx', 'booking_slots_slot_unique',
-            'booking_slots_time_idx', 'booking_status_history_booking_idx',
-            'booking_status_history_transition_unique', 'bookings_helper_status_idx',
-            'bookings_request_unique', 'bookings_resident_status_idx', 'consents_user_idx',
-            'helper_offerings_helper_idx', 'helper_offerings_package_unique',
-            'issue_status_history_issue_idx', 'issues_case_number_unique',
-            'issues_status_created_idx', 'notification_log_dedupe_unique',
-            'notification_log_status_idx', 'notification_log_user_idx',
-            'push_subscriptions_endpoint_unique', 'push_subscriptions_user_status_idx',
-            'request_slots_held_slot_unique', 'request_slots_request_idx',
-            'request_slots_time_idx', 'resident_addresses_user_idx',
-            'reviews_booking_author_unique', 'reviews_subject_idx',
-            'service_visits_booking_date_idx', 'service_visits_slot_trial_unique',
-            'service_visits_status_date_idx', 'sessions_token_unique', 'sessions_user_idx',
-            'slot_claims_booking_idx', 'slot_claims_helper_day_minute_unique',
-            'slot_claims_request_idx', 'trial_payments_booking_unique',
-            'trial_payments_helper_status_idx', 'trial_payments_resident_status_idx',
-            'user_roles_user_unique', 'users_mobile_unique',
-            'verification_documents_helper_idx', 'workflow_transitions_once_unique',
-          ];
+          const migrations = validateRepositoryMigrations('drizzle');
+          if (JSON.stringify(migrations) !== JSON.stringify(ORDERED_MIGRATION_NAMES)) {
+            throw new Error('Authoritative migration contract is inconsistent');
+          }
+          const { tables, indexes } = expectedSchemaManifest(ORDERED_MIGRATION_NAMES.length);
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/expected-migrations.json`, JSON.stringify(migrations));
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/expected-tables.json`, JSON.stringify(tables));
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/expected-indexes.json`, JSON.stringify(indexes));
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/expected-config-sha256.txt`, crypto.createHash('sha256').update(configSource).digest('hex'));
           NODE
-
-          actual_migrations="$(find drizzle -maxdepth 1 -type f -name '*.sql' -printf '%f\n' | sort)"
-          expected_migrations="$(node -e "for (const name of JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/expected-migrations.json'))) console.log(name)")"
-          [[ "${actual_migrations}" == "${expected_migrations}" ]] || {
-            echo 'The repository migration set is not the reviewed 11-file set.' >&2
-            exit 1
-          }
-
-          while read -r expected_hash migration_path; do
-            actual_hash="$(git show "HEAD:${migration_path}" | sha256sum)"
-            actual_hash="${actual_hash%% *}"
-            [[ "${actual_hash}" == "${expected_hash}" ]] || {
-              echo "Committed migration checksum mismatch: ${migration_path}" >&2
-              exit 1
-            }
-          done <<'CHECKSUMS'
-          a9928b0f74532b2a9868827546bcf18fb97086ca310cee3421cccc0ecdfe8f78  drizzle/0000_wet_obadiah_stane.sql
-          61daa01c43f63d54ffe09534ce72e3617c1454f259bceb15e3e7b510fec1c248  drizzle/0001_spooky_freak.sql
-          41948f7a56919b0be9a6b3356298e5b1039b84f29de9e18c7dfa0c18681bba62  drizzle/0002_tired_manta.sql
-          02b78d1df2e7081c1d277c44a8a63e9bd43af36ad6432cf48effa89a9014b6dd  drizzle/0003_lyrical_iron_monger.sql
-          2c8eaab75f31b99185a0e4333f897fbf873f940dbf1ead59e401d5869b979ee5  drizzle/0004_puzzling_tag.sql
-          9641b391a1e43796be88eac8ee6ce34fc80e2e0645a6c6e5dd2e17231ceb5efc  drizzle/0005_optimal_newton_destine.sql
-          a8f46796e64c3b516e29e8946148877aa9236321c66c81f633cad1333d72a03c  drizzle/0006_oval_ultimates.sql
-          1f3df6c92ddea8a92905b20983f8ebd1ba6b2bce98809ff75e9c6d2f0d89056d  drizzle/0007_strange_calypso.sql
-          905ba2617b25cb811c1a1480f83b5648ca611e9f1a9a70be173a91cf52f8024b  drizzle/0008_wealthy_lady_deathstrike.sql
-          4ed94d05f1a4a9d4f15d299ba347416251c1dd856954fc9bde878e8b2ecd9e55  drizzle/0009_unusual_black_cat.sql
-          b0df0eb0dcdfe6df2d9bd5485dad818abc44181abf5623655a9ab44d7b51f148  drizzle/0010_lonely_boom_boom.sql
-          CHECKSUMS
 
       - name: Verify authentication and read-only Cloudflare access
         env:
@@ -274,8 +202,8 @@ jobs:
           config=(--config wrangler.jsonc)
 
           "${wrangler[@]}" d1 info DB "${config[@]}" --json > "${RUNNER_TEMP}/d1-info.json"
-          node <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
           const info = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/d1-info.json`, 'utf8'));
           const result = info.result ?? info;
           if (result.uuid !== process.env.EXPECTED_DATABASE_ID && result.database_id !== process.env.EXPECTED_DATABASE_ID) {
@@ -294,15 +222,13 @@ jobs:
             --command "SELECT name,type FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%' ORDER BY type,name" \
             > "${RUNNER_TEMP}/preflight-schema.json"
 
-          node <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { parsePendingMigrationOutput } from './scripts/production-migration-contract.mjs';
           const temp = process.env.RUNNER_TEMP;
-          const expectedMigrations = JSON.parse(fs.readFileSync(`${temp}/expected-migrations.json`, 'utf8'));
           const expectedTables = JSON.parse(fs.readFileSync(`${temp}/expected-tables.json`, 'utf8'));
           const pendingText = fs.readFileSync(`${temp}/pending-migrations.txt`, 'utf8');
-          const pendingMatches = pendingText.match(/\b\d{4}_[A-Za-z0-9_]+\.sql\b/g) ?? [];
-          const pending = [...new Set(pendingMatches)];
-          if (pending.length !== pendingMatches.length) throw new Error('Pending migration output was ambiguous');
+          const pending = parsePendingMigrationOutput(pendingText);
 
           function d1Rows(path) {
             const blocks = JSON.parse(fs.readFileSync(path, 'utf8'));
@@ -319,7 +245,8 @@ jobs:
           if (new Set(applicationTables).size !== applicationTables.length) {
             throw new Error('Remote schema contains duplicate application-table names');
           }
-          if (applicationTables.length > 0 && JSON.stringify([...applicationTables].sort()) !== JSON.stringify([...expectedTables].sort())) {
+          const allowedTables = new Set(expectedTables);
+          if (applicationTables.some((name) => !allowedTables.has(name))) {
             throw new Error('Remote application-table manifest is incomplete or unexpected');
           }
 
@@ -332,19 +259,10 @@ jobs:
             fs.writeFileSync(`${temp}/preflight-row-counts.sql`, sql);
           }
           fs.writeFileSync(`${temp}/preflight-state.json`, JSON.stringify({
-            pending, tables, indexes, applicationTables, hasLedger, ledgerCount: null, rowCounts: [],
+            pending, tables, indexes, applicationTables, hasLedger, ledger: null, rowCounts: [],
           }));
           console.log(`Pending remote migrations (${pending.length}): ${pending.join(', ') || 'none'}`);
           console.log(`Remote schema: ${applicationTables.length} application tables; ${indexes.length} user-defined indexes.`);
-
-          if (process.env.OPERATION === 'apply') {
-            if (pending.length !== expectedMigrations.length || pending.some((name, index) => name !== expectedMigrations[index])) {
-              throw new Error('Apply requires exactly the reviewed 11 migrations to be pending in order');
-            }
-            if (applicationTables.length !== 0) {
-              throw new Error('Apply requires a fresh database with zero application tables');
-            }
-          }
           NODE
 
           if [[ -f "${RUNNER_TEMP}/preflight-row-counts.sql" ]]; then
@@ -357,8 +275,12 @@ jobs:
             throw new Error('Application row-count response was ambiguous');
           }
           const rows = blocks.flatMap((block) => block.results);
-          const expected = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/expected-tables.json`, 'utf8'));
-          if (rows.length !== 27 || expected.length !== 27) throw new Error('Expected exactly 27 application-table row-count results');
+          const statePath = `${process.env.RUNNER_TEMP}/preflight-state.json`;
+          const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+          const expected = state.applicationTables;
+          if (!Array.isArray(expected) || rows.length !== expected.length) {
+            throw new Error('Application-table row-count results are incomplete');
+          }
           const names = rows.map((row) => row.table_name);
           if (names.some((name) => typeof name !== 'string') || new Set(names).size !== names.length) {
             throw new Error('Application row-count names are missing, duplicated, or malformed');
@@ -369,8 +291,6 @@ jobs:
           if (rows.some((row) => !Number.isSafeInteger(row.row_count) || row.row_count < 0)) {
             throw new Error('Application row count is not a valid non-negative integer');
           }
-          const statePath = `${process.env.RUNNER_TEMP}/preflight-state.json`;
-          const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
           state.rowCounts = rows.map((row) => [row.table_name, row.row_count]).sort(([a], [b]) => a.localeCompare(b));
           fs.writeFileSync(statePath, JSON.stringify(state));
           for (const row of rows) console.log(`${row.table_name}: ${row.row_count}`);
@@ -382,8 +302,8 @@ jobs:
           if node -e "const s=require(process.env.RUNNER_TEMP + '/preflight-state.json'); process.exit(s.hasLedger ? 0 : 1)"; then
             "${wrangler[@]}" d1 execute DB "${config[@]}" --remote --json \
               --command "SELECT name FROM d1_migrations ORDER BY id" > "${RUNNER_TEMP}/preflight-ledger.json"
-          node <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
           const temp = process.env.RUNNER_TEMP;
           const blocks = JSON.parse(fs.readFileSync(`${temp}/preflight-ledger.json`, 'utf8'));
           if (!Array.isArray(blocks) || blocks.some((block) => block.success !== true || !Array.isArray(block.results))) {
@@ -391,17 +311,30 @@ jobs:
           }
           const ledger = blocks.flatMap((block) => block.results).map((row) => row.name);
           const state = JSON.parse(fs.readFileSync(`${temp}/preflight-state.json`, 'utf8'));
-          state.ledgerCount = ledger.length;
+          state.ledger = ledger;
           fs.writeFileSync(`${temp}/preflight-state.json`, JSON.stringify(state));
           console.log(`Remote migration ledger entries: ${ledger.length}.`);
-          if (process.env.OPERATION === 'apply' && ledger.length !== 0) {
-            throw new Error('Apply requires an empty migration ledger');
-          }
           NODE
           else
             echo 'Remote migration ledger: absent.'
-            node -e "const fs=require('node:fs'); const p=process.env.RUNNER_TEMP + '/preflight-state.json'; const s=JSON.parse(fs.readFileSync(p)); s.ledgerCount=0; fs.writeFileSync(p,JSON.stringify(s))"
+            node -e "const fs=require('node:fs'); const p=process.env.RUNNER_TEMP + '/preflight-state.json'; const s=JSON.parse(fs.readFileSync(p)); s.ledger=[]; fs.writeFileSync(p,JSON.stringify(s))"
           fi
+
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import { computeMigrationPlan, validateSchemaForPlan } from './scripts/production-migration-contract.mjs';
+          const statePath = `${process.env.RUNNER_TEMP}/preflight-state.json`;
+          const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+          const plan = computeMigrationPlan({
+            ledger: state.ledger,
+            pending: state.pending,
+            applicationTables: state.applicationTables,
+          });
+          validateSchemaForPlan(plan, { applicationTables: state.applicationTables, indexes: state.indexes });
+          state.plan = plan;
+          fs.writeFileSync(statePath, JSON.stringify(state));
+          console.log(`Validated exact migration prefix (${plan.applied.length}) and suffix (${plan.pending.length}).`);
+          NODE
 
       - name: Enforce production apply gate
         if: ${{ inputs.operation == 'apply' }}
@@ -418,7 +351,7 @@ jobs:
             echo 'The production confirmation phrase did not match.' >&2
             exit 1
           }
-          node -e "const s=require(process.env.RUNNER_TEMP + '/preflight-state.json'); if(s.applicationTables.length!==0 || s.ledgerCount!==0 || s.pending.length!==11) throw new Error('Remote preflight state is not safe to apply')"
+          node -e "const s=require(process.env.RUNNER_TEMP + '/preflight-state.json'); if(!s.plan || s.plan.pending.length===0) throw new Error('Remote preflight state has no reviewed migrations to apply')"
           node -e "const s=require(process.env.RUNNER_TEMP + '/cloudflare-readonly-state.json'); if(s.r2Private!==true || s.r2ObjectCount!==0) throw new Error('R2 must be private and empty before apply')"
           echo 'Production apply gate passed.'
 
@@ -459,12 +392,20 @@ jobs:
             [[ "${status}" -eq 1 ]] || { echo 'Fresh D1 schema response was ambiguous.' >&2; exit 1; }
           fi
 
-          node <<'NODE'
-          const fs = require('node:fs');
-          const crypto = require('node:crypto');
+          if [[ -f "${RUNNER_TEMP}/preflight-row-counts.sql" ]]; then
+            "${wrangler[@]}" d1 execute DB "${config[@]}" --remote --json \
+              --file "${RUNNER_TEMP}/preflight-row-counts.sql" > "${RUNNER_TEMP}/fresh-row-counts.json"
+          fi
+
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {
+            computeMigrationPlan,
+            parsePendingMigrationOutput,
+            validateSchemaForPlan,
+          } from './scripts/production-migration-contract.mjs';
           const temp = process.env.RUNNER_TEMP;
-          const expectedMigrations = JSON.parse(fs.readFileSync(`${temp}/expected-migrations.json`, 'utf8'));
-          const expectedTables = JSON.parse(fs.readFileSync(`${temp}/expected-tables.json`, 'utf8'));
           const info = JSON.parse(fs.readFileSync(`${temp}/fresh-d1-info.json`, 'utf8'));
           const expectedConfigHash = fs.readFileSync(`${temp}/expected-config-sha256.txt`, 'utf8');
           const currentConfigHash = crypto.createHash('sha256').update(fs.readFileSync('wrangler.jsonc')).digest('hex');
@@ -483,27 +424,25 @@ jobs:
             return blocks.flatMap((block) => block.results);
           }
           const pendingText = fs.readFileSync(`${temp}/fresh-pending-migrations.txt`, 'utf8');
-          const pendingMatches = pendingText.match(/\b\d{4}_[A-Za-z0-9_]+\.sql\b/g) ?? [];
-          const pending = [...new Set(pendingMatches)];
-          if (pending.length !== pendingMatches.length || JSON.stringify(pending) !== JSON.stringify(expectedMigrations)) {
-            throw new Error('Fresh pre-apply state does not have exactly the reviewed 11 migrations pending');
-          }
+          const pending = parsePendingMigrationOutput(pendingText);
           const schema = d1Rows(`${temp}/fresh-schema.json`);
           const tables = schema.filter((row) => row.type === 'table').map((row) => row.name);
           const indexes = schema.filter((row) => row.type === 'index').map((row) => row.name);
           const applicationTables = tables.filter((name) => name !== 'd1_migrations' && !name.startsWith('_cf_'));
           const hasLedger = tables.includes('d1_migrations');
           const ledger = hasLedger ? d1Rows(`${temp}/fresh-ledger.json`).map((row) => row.name) : [];
-          if (applicationTables.length !== 0 || ledger.length !== 0) {
-            throw new Error('Fresh pre-apply database is not in the empty bootstrap state');
-          }
-          if (expectedTables.length !== 27) throw new Error('Reviewed application-table manifest is not exactly 27 tables');
-          const fresh = { pending, tables, indexes, applicationTables, hasLedger, ledgerCount: ledger.length, rowCounts: [] };
+          const plan = computeMigrationPlan({ ledger, pending, applicationTables });
+          validateSchemaForPlan(plan, { applicationTables, indexes });
+          if (plan.pending.length === 0) throw new Error('Fresh pre-apply state has no reviewed migrations to apply');
+          const rowCounts = fs.existsSync(`${temp}/fresh-row-counts.json`)
+            ? d1Rows(`${temp}/fresh-row-counts.json`).map((row) => [row.table_name, row.row_count]).sort(([a], [b]) => a.localeCompare(b))
+            : [];
+          const fresh = { pending, tables, indexes, applicationTables, hasLedger, ledger, rowCounts, plan };
           const preflight = JSON.parse(fs.readFileSync(`${temp}/preflight-state.json`, 'utf8'));
           if (JSON.stringify(fresh) !== JSON.stringify(preflight)) {
             throw new Error('Remote migration ledger, schema, pending migrations, or row-count state changed after preflight');
           }
-          console.log('Fresh pre-apply D1 identity and unchanged empty bootstrap state verified.');
+          console.log(`Fresh pre-apply D1 state verified; applying ${plan.pending.length} ordered migration(s).`);
           NODE
 
           npm run cloudflare:d1:migrations:apply
@@ -526,8 +465,12 @@ jobs:
           "${wrangler[@]}" d1 execute DB "${config[@]}" --remote --json \
             --command "PRAGMA foreign_key_check" > "${RUNNER_TEMP}/post-foreign-keys.json"
 
-          node <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {
+            parsePendingMigrationOutput,
+            requireDeploymentReady,
+          } from './scripts/production-migration-contract.mjs';
           const temp = process.env.RUNNER_TEMP;
           const expectedMigrations = JSON.parse(fs.readFileSync(`${temp}/expected-migrations.json`, 'utf8'));
           const expectedTables = JSON.parse(fs.readFileSync(`${temp}/expected-tables.json`, 'utf8'));
@@ -540,8 +483,7 @@ jobs:
             }
             return blocks.flatMap((block) => block.results);
           }
-          const pendingText = fs.readFileSync(`${temp}/post-pending-migrations.txt`, 'utf8');
-          if (/\b\d{4}_[A-Za-z0-9_]+\.sql\b/.test(pendingText)) throw new Error('Migrations remain pending after apply');
+          const pending = parsePendingMigrationOutput(fs.readFileSync(`${temp}/post-pending-migrations.txt`, 'utf8'));
 
           const schema = rows('post-schema.json');
           const actualTables = schema.filter((row) => row.type === 'table' && row.name !== 'd1_migrations' && !row.name.startsWith('_cf_')).map((row) => row.name).sort();
@@ -550,6 +492,7 @@ jobs:
           if (JSON.stringify(actualIndexes) !== JSON.stringify([...expectedIndexes].sort())) throw new Error('Production index set is unexpected');
 
           const ledger = rows('post-ledger.json').map((row) => row.name);
+          requireDeploymentReady({ applied: ledger, pending });
           if (JSON.stringify(ledger) !== JSON.stringify(expectedMigrations)) throw new Error('Production migration ledger is unexpected');
           if (rows('post-foreign-keys.json').length !== 0) throw new Error('Foreign-key violations exist');
 
@@ -564,15 +507,15 @@ jobs:
 
           "${wrangler[@]}" d1 execute DB "${config[@]}" --remote --json \
             --file "${RUNNER_TEMP}/post-row-counts.sql" > "${RUNNER_TEMP}/post-row-counts.json"
-          node <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
           const blocks = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/post-row-counts.json`, 'utf8'));
           if (!Array.isArray(blocks) || blocks.some((block) => block.success !== true || !Array.isArray(block.results))) {
             throw new Error('Post-apply row-count response was ambiguous');
           }
           const rows = blocks.flatMap((block) => block.results);
           const expected = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/expected-tables.json`, 'utf8'));
-          if (rows.length !== 27 || expected.length !== 27) throw new Error('Expected exactly 27 post-apply row-count results');
+          if (rows.length !== expected.length) throw new Error('Post-apply row-count result count is incomplete');
           const names = rows.map((row) => row.table_name);
           if (names.some((name) => typeof name !== 'string') || new Set(names).size !== names.length) {
             throw new Error('Post-apply row-count names are missing, duplicated, or malformed');
@@ -583,13 +526,15 @@ jobs:
           if (rows.some((row) => !Number.isSafeInteger(row.row_count) || row.row_count < 0)) {
             throw new Error('Post-apply row count is not a valid non-negative integer');
           }
-          const expectedCounts = new Map(expected.map((name) => [
-            name,
-            name === 'issue_case_counter' ? 1 : 0,
-          ]));
+          const preflight = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/preflight-state.json`, 'utf8'));
+          if (!Array.isArray(preflight.rowCounts)) throw new Error('Preflight row-count baseline is unavailable');
+          const expectedCounts = new Map(preflight.rowCounts);
+          for (const name of expected) {
+            if (!expectedCounts.has(name)) expectedCounts.set(name, name === 'issue_case_counter' ? 1 : 0);
+          }
           const unexpectedCounts = rows.filter((row) => row.row_count !== expectedCounts.get(row.table_name));
-          if (unexpectedCounts.length !== 0) throw new Error('Application bootstrap record counts are unexpected');
-          console.log(`Verified expected bootstrap record counts across ${rows.length} application tables.`);
+          if (unexpectedCounts.length !== 0) throw new Error('Application row counts changed unexpectedly during migration');
+          console.log(`Verified preserved application row counts across ${rows.length} application tables.`);
           NODE
 
           node --input-type=module <<'NODE'
