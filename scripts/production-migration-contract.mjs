@@ -212,6 +212,17 @@ export function requireDeploymentReady(plan) {
   }
 }
 
+export function requireR2RolloutReady(plan, { r2Private, r2HasObjects }) {
+  if (!plan || !Array.isArray(plan.applied)) throw new Error("Migration plan is malformed");
+  if (r2Private !== true || typeof r2HasObjects !== "boolean") {
+    throw new Error("R2 rollout state is malformed or not private");
+  }
+  if (plan.applied.length === 0 && r2HasObjects) {
+    throw new Error("An empty D1 bootstrap requires an empty R2 bucket");
+  }
+  return Object.freeze({ r2Private, r2HasObjects });
+}
+
 export function validateRepositoryMigrations(directory) {
   const actualNames = readdirSync(directory).filter((name) => name.endsWith(".sql")).sort();
   if (actualNames.length !== ORDERED_MIGRATION_NAMES.length

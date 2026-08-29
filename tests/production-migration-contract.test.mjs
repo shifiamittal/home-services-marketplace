@@ -11,6 +11,7 @@ import {
   expectedSchemaManifest,
   parsePendingMigrationOutput,
   requireDeploymentReady,
+  requireR2RolloutReady,
   validateProductionConfiguration,
   validateRepositoryMigrations,
   validateSchemaForPlan,
@@ -82,6 +83,33 @@ test("empty database bootstraps with all 13 migrations in order", () => {
 test("established database applies only 0011 and 0012 in order", () => {
   const plan = computeMigrationPlan({ ledger: established, pending: incremental, applicationTables: tables });
   assert.deepEqual(plan.pending, ["0011_fancy_exiles.sql", "0012_confused_starbolt.sql"]);
+});
+
+test("empty D1 bootstrap accepts empty R2", () => {
+  const plan = computeMigrationPlan({ ledger: [], pending: ORDERED_MIGRATION_NAMES, applicationTables: [] });
+  assert.doesNotThrow(() => requireR2RolloutReady(plan, { r2Private: true, r2HasObjects: false }));
+});
+
+test("empty D1 bootstrap rejects nonempty R2", () => {
+  const plan = computeMigrationPlan({ ledger: [], pending: ORDERED_MIGRATION_NAMES, applicationTables: [] });
+  assert.throws(
+    () => requireR2RolloutReady(plan, { r2Private: true, r2HasObjects: true }),
+    /empty D1 bootstrap requires an empty R2 bucket/,
+  );
+});
+
+for (const r2HasObjects of [false, true]) {
+  test(`established migration prefix through 0010 accepts ${r2HasObjects ? "nonempty" : "empty"} R2`, () => {
+    const plan = computeMigrationPlan({ ledger: established, pending: incremental, applicationTables: tables });
+    assert.doesNotThrow(() => requireR2RolloutReady(plan, { r2Private: true, r2HasObjects }));
+  });
+}
+
+test("every valid established prefix accepts existing private R2 objects", () => {
+  for (let appliedCount = 1; appliedCount <= ORDERED_MIGRATION_NAMES.length; appliedCount += 1) {
+    const plan = { applied: ORDERED_MIGRATION_NAMES.slice(0, appliedCount) };
+    assert.doesNotThrow(() => requireR2RolloutReady(plan, { r2Private: true, r2HasObjects: true }));
+  }
 });
 
 test("fully migrated database is deployment-ready", () => {
@@ -227,6 +255,18 @@ test("both production workflows consume the shared migration contract", () => {
   assert.doesNotMatch(migrationWorkflow, /rows\.length !== 27|expected\.length !== 27/);
   assert.match(deploymentWorkflow, /requireDeploymentReady/);
   assert.match(deploymentWorkflow, /complete 13-entry ledger verified; zero migrations pending/);
+});
+
+test("production migration and deployment scripts never access R2 object contents or mutate R2", () => {
+  const files = [
+    ".github/workflows/cloudflare-production-migrations.yml",
+    ".github/workflows/cloudflare-production-deployment.yml",
+    "scripts/cloudflare-production.sh",
+  ];
+  const source = files.map((file) => readFileSync(file, "utf8")).join("\n");
+  assert.doesNotMatch(source, /^\s*(?:\.\/node_modules\/\.bin\/)?wrangler\s+r2\s+object\s+(?:get|put|delete)/im);
+  assert.doesNotMatch(source, /\/r2\/buckets\/[^\s'"`]+\/objects\/[^?\s'"`]+/i);
+  assert.doesNotMatch(source, /method:\s*['"](?:POST|PUT|PATCH|DELETE)['"][\s\S]{0,300}\/r2\/buckets\//i);
 });
 
 test("both workflows parse and every embedded Bash and JavaScript block is syntactically valid", () => {

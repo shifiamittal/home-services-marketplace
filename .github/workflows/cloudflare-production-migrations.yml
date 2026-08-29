@@ -180,17 +180,16 @@ jobs:
 
           const objects = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?per_page=1`);
           if (!Array.isArray(objects.result)) throw new Error('R2 object-list response was unexpected');
-          if (objects.result.length !== 0) throw new Error('The production R2 bucket is not empty');
 
           if (managed.result.enabled || custom.result.domains.length !== 0) {
             throw new Error('The production R2 bucket is publicly accessible');
           }
           fs.writeFileSync(`${process.env.RUNNER_TEMP}/cloudflare-readonly-state.json`, JSON.stringify({
             r2Private: true,
-            r2ObjectCount: 0,
+            r2HasObjects: objects.result.length !== 0,
           }));
           console.log(`Workers Scripts access verified (${scripts.result.length} visible).`);
-          console.log('R2 private: yes; custom domains: 0; objects: 0.');
+          console.log(`R2 private: yes; custom domains: 0; objects present: ${objects.result.length !== 0 ? 'yes' : 'no'}.`);
           NODE
 
       - name: Run complete remote preflight
@@ -322,7 +321,7 @@ jobs:
 
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
-          import { computeMigrationPlan, validateSchemaForPlan } from './scripts/production-migration-contract.mjs';
+          import { computeMigrationPlan, requireR2RolloutReady, validateSchemaForPlan } from './scripts/production-migration-contract.mjs';
           const statePath = `${process.env.RUNNER_TEMP}/preflight-state.json`;
           const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
           const plan = computeMigrationPlan({
@@ -331,6 +330,8 @@ jobs:
             applicationTables: state.applicationTables,
           });
           validateSchemaForPlan(plan, { applicationTables: state.applicationTables, indexes: state.indexes });
+          const r2 = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/cloudflare-readonly-state.json`, 'utf8'));
+          requireR2RolloutReady(plan, r2);
           state.plan = plan;
           fs.writeFileSync(statePath, JSON.stringify(state));
           console.log(`Validated exact migration prefix (${plan.applied.length}) and suffix (${plan.pending.length}).`);
@@ -352,7 +353,7 @@ jobs:
             exit 1
           }
           node -e "const s=require(process.env.RUNNER_TEMP + '/preflight-state.json'); if(!s.plan || s.plan.pending.length===0) throw new Error('Remote preflight state has no reviewed migrations to apply')"
-          node -e "const s=require(process.env.RUNNER_TEMP + '/cloudflare-readonly-state.json'); if(s.r2Private!==true || s.r2ObjectCount!==0) throw new Error('R2 must be private and empty before apply')"
+          node --input-type=module -e "import {requireR2RolloutReady} from './scripts/production-migration-contract.mjs'; const fs=await import('node:fs'); const t=process.env.RUNNER_TEMP; requireR2RolloutReady(JSON.parse(fs.readFileSync(t + '/preflight-state.json')).plan, JSON.parse(fs.readFileSync(t + '/cloudflare-readonly-state.json')))"
           echo 'Production apply gate passed.'
 
       - name: Apply reviewed production migrations
@@ -366,7 +367,7 @@ jobs:
           [[ "${GITHUB_REF_NAME}" == "${DEFAULT_BRANCH}" && "${DEFAULT_BRANCH}" == 'main' ]]
           [[ "${CONFIRMATION}" == 'APPLY_NIVASA_PRODUCTION_MIGRATIONS' ]]
           [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]
-          node -e "const s=require(process.env.RUNNER_TEMP + '/cloudflare-readonly-state.json'); if(s.r2Private!==true || s.r2ObjectCount!==0) throw new Error('R2 state is not safe to apply')"
+          node --input-type=module -e "import {requireR2RolloutReady} from './scripts/production-migration-contract.mjs'; const fs=await import('node:fs'); const t=process.env.RUNNER_TEMP; requireR2RolloutReady(JSON.parse(fs.readFileSync(t + '/preflight-state.json')).plan, JSON.parse(fs.readFileSync(t + '/cloudflare-readonly-state.json')))"
 
           wrangler=(./node_modules/.bin/wrangler)
           config=(--config wrangler.jsonc)
@@ -559,6 +560,7 @@ jobs:
           }
           const objects = await get(`/accounts/${accountId}/r2/buckets/${bucket}/objects?per_page=1`);
           if (!Array.isArray(objects.result)) throw new Error('R2 object-list response was unexpected');
-          if (objects.result.length !== 0) throw new Error('R2 bucket is not empty');
-          console.log('R2 remains private and empty.');
+          const before = JSON.parse((await import('node:fs')).readFileSync(`${process.env.RUNNER_TEMP}/cloudflare-readonly-state.json`, 'utf8'));
+          if ((objects.result.length !== 0) !== before.r2HasObjects) throw new Error('R2 object-presence state changed during migration');
+          console.log(`R2 remains private; object-presence state is unchanged (${before.r2HasObjects ? 'nonempty' : 'empty'}).`);
           NODE
