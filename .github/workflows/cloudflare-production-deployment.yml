@@ -85,9 +85,13 @@ jobs:
             exit 1
           }
 
-          node --input-type=commonjs <<'NODE'
-          const fs = require('node:fs');
-          const crypto = require('node:crypto');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          import {
+            ORDERED_MIGRATION_NAMES,
+            validateRepositoryMigrations,
+          } from './scripts/production-migration-contract.mjs';
 
           function stripJsonComments(source) {
             let output = '';
@@ -119,6 +123,15 @@ jobs:
           }
 
           const source = fs.readFileSync('wrangler.jsonc', 'utf8');
+          const migrationNames = validateRepositoryMigrations('drizzle');
+          if (JSON.stringify(migrationNames) !== JSON.stringify(ORDERED_MIGRATION_NAMES)) {
+            throw new Error('Authoritative migration contract is inconsistent');
+          }
+          fs.writeFileSync(
+            `${process.env.RUNNER_TEMP}/nivasa-expected-migrations.json`,
+            JSON.stringify(migrationNames),
+            { mode: 0o600 },
+          );
           const config = JSON.parse(stripJsonComments(source));
           const database = config.d1_databases?.find((item) => item.binding === 'DB');
           const bucket = config.r2_buckets?.find((item) => item.binding === 'BUCKET');
@@ -820,8 +833,12 @@ jobs:
           NODE
           chmod 600 "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs"
 
-          cat > "${RUNNER_TEMP}/nivasa-validate-d1.cjs" <<'NODE'
-          const fs = require('node:fs');
+          cat > "${RUNNER_TEMP}/nivasa-validate-d1.mjs" <<'NODE'
+          import fs from 'node:fs';
+          import { pathToFileURL } from 'node:url';
+          const { parsePendingMigrationOutput, requireDeploymentReady } = await import(
+            pathToFileURL(`${process.env.GITHUB_WORKSPACE}/scripts/production-migration-contract.mjs`).href
+          );
           const temp = process.env.RUNNER_TEMP;
           const infoDocument = JSON.parse(fs.readFileSync(`${temp}/nivasa-d1-info.json`, 'utf8'));
           const info = infoDocument.result ?? infoDocument;
@@ -833,25 +850,18 @@ jobs:
             throw new Error('Remote D1 ledger response was ambiguous');
           }
           const actual = blocks.flatMap((block) => block.results).map((row) => row.name);
-          const expected = [
-            '0000_wet_obadiah_stane.sql', '0001_spooky_freak.sql', '0002_tired_manta.sql',
-            '0003_lyrical_iron_monger.sql', '0004_puzzling_tag.sql', '0005_optimal_newton_destine.sql',
-            '0006_oval_ultimates.sql', '0007_strange_calypso.sql', '0008_wealthy_lady_deathstrike.sql',
-            '0009_unusual_black_cat.sql', '0010_lonely_boom_boom.sql',
-          ];
-          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Remote D1 migration ledger is unexpected');
-          const pending = fs.readFileSync(`${temp}/nivasa-pending-migrations.txt`, 'utf8');
-          if (/\b\d{4}_[A-Za-z0-9_]+\.sql\b/.test(pending)) throw new Error('Remote D1 migrations remain pending');
-          console.log('Remote D1 identity and completed 11-entry ledger verified; zero migrations pending.');
+          const pending = parsePendingMigrationOutput(fs.readFileSync(`${temp}/nivasa-pending-migrations.txt`, 'utf8'));
+          requireDeploymentReady({ applied: actual, pending });
+          console.log('Remote D1 identity and complete 13-entry ledger verified; zero migrations pending.');
           NODE
-          chmod 600 "${RUNNER_TEMP}/nivasa-validate-d1.cjs"
+          chmod 600 "${RUNNER_TEMP}/nivasa-validate-d1.mjs"
 
           run_d1_checks() {
             ./node_modules/.bin/wrangler d1 info DB --config wrangler.jsonc --json > "${RUNNER_TEMP}/nivasa-d1-info.json"
             ./node_modules/.bin/wrangler d1 migrations list DB --config wrangler.jsonc --remote > "${RUNNER_TEMP}/nivasa-pending-migrations.txt"
             ./node_modules/.bin/wrangler d1 execute DB --config wrangler.jsonc --remote --json \
               --command 'SELECT name FROM d1_migrations ORDER BY id' > "${RUNNER_TEMP}/nivasa-d1-ledger.json"
-            node "${RUNNER_TEMP}/nivasa-validate-d1.cjs"
+            node "${RUNNER_TEMP}/nivasa-validate-d1.mjs"
           }
 
           STATE_PATH="${RUNNER_TEMP}/nivasa-preflight-state.json" REQUIRE_WORKER=1 REQUIRE_ALL_SECRETS=1 REQUIRE_ACCESS_STATE=either \
@@ -908,25 +918,22 @@ jobs:
             > "${RUNNER_TEMP}/nivasa-final-pending.txt"
           ./node_modules/.bin/wrangler d1 execute DB --config wrangler.jsonc --remote --json \
             --command 'SELECT name FROM d1_migrations ORDER BY id' > "${RUNNER_TEMP}/nivasa-final-ledger.json"
-          if grep -Eq '\b[0-9]{4}_[A-Za-z0-9_]+\.sql\b' "${RUNNER_TEMP}/nivasa-final-pending.txt"; then
-            echo 'Remote D1 migrations are unexpectedly pending.' >&2
-            exit 1
-          fi
-          node --input-type=commonjs <<'NODE'
-          const fs = require('node:fs');
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import {
+            parsePendingMigrationOutput,
+            requireDeploymentReady,
+          } from './scripts/production-migration-contract.mjs';
           const blocks = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/nivasa-final-ledger.json`, 'utf8'));
           if (!Array.isArray(blocks) || blocks.length === 0
               || blocks.some((block) => block.success !== true || !Array.isArray(block.results))) {
             throw new Error('Final D1 ledger response was ambiguous');
           }
           const actual = blocks.flatMap((block) => block.results).map((row) => row.name);
-          const expected = [
-            '0000_wet_obadiah_stane.sql', '0001_spooky_freak.sql', '0002_tired_manta.sql',
-            '0003_lyrical_iron_monger.sql', '0004_puzzling_tag.sql', '0005_optimal_newton_destine.sql',
-            '0006_oval_ultimates.sql', '0007_strange_calypso.sql', '0008_wealthy_lady_deathstrike.sql',
-            '0009_unusual_black_cat.sql', '0010_lonely_boom_boom.sql',
-          ];
-          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('Final D1 migration ledger is unexpected');
+          const pending = parsePendingMigrationOutput(
+            fs.readFileSync(`${process.env.RUNNER_TEMP}/nivasa-final-pending.txt`, 'utf8'),
+          );
+          requireDeploymentReady({ applied: actual, pending });
           NODE
           version_id="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(!s.versionId)process.exit(1); process.stdout.write(s.versionId)")"
           verified_url="$(node -e "const s=JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/nivasa-final-state.json')); if(s.publicUrl!==process.env.EXPECTED_WORKERS_DEV_URL)process.exit(1); process.stdout.write(s.publicUrl)")"
@@ -939,7 +946,7 @@ jobs:
         run: |
           rm -f -- \
             "${RUNNER_TEMP}/nivasa-inspect-cloudflare.mjs" \
-            "${RUNNER_TEMP}/nivasa-validate-d1.cjs" \
+            "${RUNNER_TEMP}/nivasa-validate-d1.mjs" \
             "${RUNNER_TEMP}/nivasa-reviewed-config.sha256" \
             "${RUNNER_TEMP}/nivasa-reviewed-artifact.sha256" \
             "${RUNNER_TEMP}/nivasa-preflight-state.json" \
@@ -950,5 +957,6 @@ jobs:
             "${RUNNER_TEMP}/nivasa-d1-ledger.json" \
             "${RUNNER_TEMP}/nivasa-final-ledger.json" \
             "${RUNNER_TEMP}/nivasa-pending-migrations.txt" \
+            "${RUNNER_TEMP}/nivasa-expected-migrations.json" \
             "${RUNNER_TEMP}/nivasa-final-pending.txt"
           echo 'Temporary deployment material removed.'
