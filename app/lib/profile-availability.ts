@@ -1,6 +1,6 @@
 import { deadlineInstant } from "./workflow-integrity";
 
-export type ProfileWindow = { day: number; start: number; end: number; pattern: string };
+export type ProfileWindow = { day: number; start: number; end: number; pattern: string | null };
 
 // Evaluated INSIDE the save batch, not just in a pre-read. Concurrent request
 // creation is serialized with this check and has its own fresh-window guard.

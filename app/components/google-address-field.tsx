@@ -2,6 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import type { HelperAddress } from "../lib/helper-address";
+import { detectHelperLocation as detectLocation, type HelperGeolocation } from "../lib/helper-location";
+
 export type SelectedAddress = {
   formattedAddress: string;
   locality: string;
@@ -47,6 +50,42 @@ async function loadGoogleMaps() {
       });
     });
   return mapsPromise;
+}
+
+function componentValue(components: Array<{ longText?: string; long_name?: string; types?: string[] }>, type: string) {
+  const component = components.find(item => item.types?.includes(type));
+  return component?.longText || component?.long_name || "";
+}
+
+export async function reverseGeocodeHelperLocation(latitude: number, longitude: number): Promise<HelperAddress> {
+  const google = await loadGoogleMaps();
+  const geocoding = await google?.maps?.importLibrary?.("geocoding") as {
+    Geocoder?: new () => { geocode: (request: { location: { lat: number; lng: number } }) => Promise<{
+      results?: Array<{ addressComponents?: Array<{ longText?: string; long_name?: string; types?: string[] }>; address_components?: Array<{ longText?: string; long_name?: string; types?: string[] }> }>;
+    }> };
+  } | undefined;
+  if (!geocoding?.Geocoder) throw new Error("Address detection is unavailable.");
+  const result = await new geocoding.Geocoder().geocode({ location: { lat: latitude, lng: longitude } });
+  const first = result.results?.[0];
+  const components = first?.addressComponents || first?.address_components || [];
+  if (!first || !components.length) throw new Error("We could not identify this address.");
+  const house = componentValue(components, "street_number") || componentValue(components, "subpremise");
+  const building = componentValue(components, "premise") || componentValue(components, "sublocality_level_1");
+  const city = componentValue(components, "locality") || componentValue(components, "administrative_area_level_2");
+  return {
+    houseOrFlat: house,
+    floor: "",
+    buildingOrSociety: building,
+    city,
+    state: componentValue(components, "administrative_area_level_1"),
+    pinCode: componentValue(components, "postal_code"),
+  };
+}
+
+export function detectHelperLocation(
+  geolocation: HelperGeolocation | undefined,
+) {
+  return detectLocation(geolocation, reverseGeocodeHelperLocation);
 }
 
 export function GoogleAddressField({

@@ -1,6 +1,6 @@
 export type ValidAddressProof = {
-  contentType: "image/jpeg" | "image/png" | "application/pdf";
-  extension: "jpg" | "png" | "pdf";
+  contentType: "image/jpeg" | "image/png";
+  extension: "jpg" | "png";
   filename: string;
 };
 
@@ -28,18 +28,32 @@ function validJpeg(bytes: Uint8Array) {
   if (!startsWith(bytes, [0xff, 0xd8, 0xff]) || !endsWith(bytes, [0xff, 0xd9])) return false;
   let position = 2;
   let hasFrame = false;
+  let hasScan = false;
   while (position < bytes.length - 1) {
     if (bytes[position] !== 0xff) return false;
     while (bytes[position] === 0xff) position += 1;
     const marker = bytes[position++];
-    if (marker === 0xd9) return hasFrame && position === bytes.length;
+    if (marker === 0xd9) return hasFrame && hasScan && position === bytes.length;
     if (marker === 0x00 || marker === 0x01 || marker >= 0xd0 && marker <= 0xd7) continue;
     if (position + 2 > bytes.length) return false;
     const length = bytes[position] * 256 + bytes[position + 1];
     if (length < 2 || position + length > bytes.length) return false;
-    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) hasFrame = true;
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      // Beta accepts conventional baseline and progressive Huffman JPEGs.
+      if (![0xc0, 0xc2].includes(marker) || hasFrame || length < 11
+        || bytes[position + 2] !== 8
+        || bytes[position + 3] * 256 + bytes[position + 4] === 0
+        || bytes[position + 5] * 256 + bytes[position + 6] === 0
+        || ![1, 3, 4].includes(bytes[position + 7])
+        || length !== 8 + 3 * bytes[position + 7]) return false;
+      hasFrame = true;
+    }
     if (marker === 0xda) {
+      if (!hasFrame || length < 8 || bytes[position + 2] < 1
+        || bytes[position + 2] > 4 || length !== 6 + 2 * bytes[position + 2]) return false;
+      hasScan = true;
       position += length;
+      const scanStart = position;
       while (position < bytes.length - 1) {
         if (bytes[position] !== 0xff) {
           position += 1;
@@ -50,9 +64,13 @@ function validJpeg(bytes: Uint8Array) {
           position += 2;
           continue;
         }
-        return next === 0xd9 && hasFrame && position + 2 === bytes.length;
+        if (position === scanStart) return false;
+        if (next === 0xd9) return position + 2 === bytes.length;
+        // Progressive images contain more than one scan. Resume marker parsing.
+        break;
       }
-      return false;
+      if (position >= bytes.length - 1) return false;
+      continue;
     }
     position += length;
   }
@@ -63,12 +81,42 @@ function validPng(bytes: Uint8Array) {
   if (!startsWith(bytes, PNG_SIGNATURE) || !endsWith(bytes, PNG_IEND)) return false;
   let position = PNG_SIGNATURE.length;
   let first = true;
+  let hasData = false;
+  let dataEnded = false;
+  let hasPalette = false;
+  let color = -1;
   while (position + 12 <= bytes.length) {
     const length = bytes[position] * 0x1000000 + bytes[position + 1] * 0x10000 + bytes[position + 2] * 0x100 + bytes[position + 3];
     const type = ascii(bytes.subarray(position + 4, position + 8));
     const chunkEnd = position + 12 + length;
     if (length < 0 || chunkEnd > bytes.length || first && (type !== "IHDR" || length !== 13)) return false;
-    if (type === "IEND") return length === 0 && chunkEnd === bytes.length;
+    if (!/^[A-Za-z]{4}$/.test(type)) return false;
+    // Every chunk carries a CRC over its type and payload.
+    let crc = 0xffffffff;
+    for (let offset = position + 4; offset < chunkEnd - 4; offset += 1) {
+      crc ^= bytes[offset];
+      for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+    const expected = new DataView(bytes.buffer, bytes.byteOffset + chunkEnd - 4, 4).getUint32(0);
+    if (((crc ^ 0xffffffff) >>> 0) !== expected) return false;
+    if (type === "IHDR") {
+      if (!first) return false;
+      const header = new DataView(bytes.buffer, bytes.byteOffset + position + 8, 13);
+      color = header.getUint8(9);
+      const depths: Record<number, number[]> = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+      if (!header.getUint32(0) || !header.getUint32(4) || !depths[color]?.includes(header.getUint8(8))
+        || header.getUint8(10) !== 0 || header.getUint8(11) !== 0 || header.getUint8(12) > 1) return false;
+    } else if (type === "PLTE") {
+      if (hasPalette || hasData || [0, 4].includes(color) || length === 0 || length > 768 || length % 3) return false;
+      hasPalette = true;
+    } else if (type === "IDAT") {
+      if (dataEnded || color === 3 && !hasPalette) return false;
+      if (length > 0) hasData = true;
+    } else if (type === "IEND") return hasData && length === 0 && chunkEnd === bytes.length;
+    else {
+      if (type[0] === type[0].toUpperCase()) return false; // Unknown critical chunk.
+      if (hasData) dataEnded = true;
+    }
     first = false;
     position = chunkEnd;
   }
@@ -105,16 +153,12 @@ export function validateAddressProof(
   } else if (validPng(bytes)) {
     contentType = "image/png";
     extension = "png";
-  } else if (startsWith(bytes, [0x25, 0x50, 0x44, 0x46, 0x2d])) {
-    const text = ascii(bytes);
-    const tail = text.slice(-1_024);
-    if (!tail.includes("%%EOF") || containsActiveContent(text)) throw new Error("unsafe_pdf");
-    contentType = "application/pdf";
-    extension = "pdf";
   } else {
     throw new Error("unsupported_signature");
   }
 
   if (declaredType !== contentType) throw new Error("mime_mismatch");
+  const suppliedExtension = filename.split(/[\\/]/).pop()?.match(/\.([^.]+)$/)?.[1].toLowerCase();
+  if (!(extension === "jpg" ? ["jpg", "jpeg"] : ["png"]).includes(suppliedExtension ?? "")) throw new Error("extension_mismatch");
   return { contentType, extension, filename: sanitizeUploadFilename(filename, extension) };
 }

@@ -1,8 +1,14 @@
 "use client";
 
+import { HelperWorkingHours } from "./components/helper-working-hours";
+import type { EditorWindow } from "./lib/helper-schedule";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { GoogleAddressField, SelectedAddress } from "./components/google-address-field";
+import { detectHelperLocation, GoogleAddressField, SelectedAddress } from "./components/google-address-field";
+import type { HelperAddress } from "./lib/helper-address";
 import { HelperNavigation } from "./components/helper-navigation";
+import { HelperServicePricing } from "./components/helper-service-pricing";
+import { HelperBusyPeriods } from "./components/helper-busy-periods";
+import type { BusyEditorPeriod } from "./lib/helper-busy-periods";
 import { avatarInitial, residentDestination, residentManagement, residentLoadDisposition } from "./lib/resident-navigation";
 import type { BookingWorkflowState } from "./lib/booking-workflow";
 
@@ -83,6 +89,13 @@ function providerMessage(error: unknown, fallback: string) {
     if (typeof record.message === "string" && record.message.trim()) return record.message;
   }
   return fallback;
+}
+
+function rupeesToPaise(value: string) {
+  if (!/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(value)) return Number.NaN;
+  const [rupees, fraction = ""] = value.split(".");
+  const paise = Number(rupees) * 100 + Number(fraction.padEnd(2, "0"));
+  return Number.isSafeInteger(paise) ? paise : Number.NaN;
 }
 
 function msg91AccessToken(data: unknown, depth = 0): string {
@@ -240,7 +253,6 @@ export default function Home() {
   const [profilePauseBusy, setProfilePauseBusy] = useState(false);
   const [addressProofUploaded, setAddressProofUploaded] = useState(false);
   const [addressProofName, setAddressProofName] = useState("");
-  const [addressProofType, setAddressProofType] = useState("aadhaar");
   const [proofUploading, setProofUploading] = useState(false);
   const [savedResidentName, setSavedResidentName] = useState("");
   const residentDraftTouched = useRef(false);
@@ -250,7 +262,7 @@ export default function Home() {
   const residentLoadRef = useRef(0);
   const residentNavigationRef = useRef(0);
   const helperDraftLoaded = useRef(false);
-  const proofRetryRef = useRef<{ file: File; documentType: string } | null>(null);
+  const proofRetryRef = useRef<{ file: File } | null>(null);
   const [proofRetryAvailable, setProofRetryAvailable] = useState(false);
   const [savedProfileStatus, setSavedProfileStatus] = useState("draft");
   const proofInputRef = useRef<HTMLInputElement | null>(null);
@@ -259,17 +271,31 @@ export default function Home() {
   const [setupLoading, setSetupLoading] = useState(false);
   const [setupSaving, setSetupSaving] = useState(false);
   const [setupError, setSetupError] = useState("");
-  const [helperLocality, setHelperLocality] = useState("");
-  const [helperAddress, setHelperAddress] = useState<SelectedAddress | null>(null);
+  const [setupFields, setSetupFields] = useState<Record<string, string>>({});
+  const setupSavingRef = useRef(false);
+  const [helperAddressFields, setHelperAddressFields] = useState<HelperAddress>({ houseOrFlat: "", floor: "", buildingOrSociety: "", city: "", state: "", pinCode: "" });
+  const [helperCoordinates, setHelperCoordinates] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [preserveLegacyHelperAddress, setPreserveLegacyHelperAddress] = useState(false);
+  const [legacyHelperAddress, setLegacyHelperAddress] = useState("");
+  const [helperLocationBusy, setHelperLocationBusy] = useState(false);
+  const [helperLocationError, setHelperLocationError] = useState("");
   const [helperTravelDistance, setHelperTravelDistance] = useState("");
   const [yearsExperience, setYearsExperience] = useState("");
-  const [houseCleaningEnabled, setHouseCleaningEnabled] = useState(false);
+  const [houseSizes, setHouseSizes] = useState({ oneTwo: false, three: false, fourPlus: false });
   const [housePrices, setHousePrices] = useState({ oneTwo: "", three: "", fourPlus: "" });
   const [utensilsOnceEnabled, setUtensilsOnceEnabled] = useState(false);
   const [utensilsOncePrice, setUtensilsOncePrice] = useState("");
   const [utensilsTwiceEnabled, setUtensilsTwiceEnabled] = useState(false);
-  const [utensilsTwicePrice, setUtensilsTwicePrice] = useState("");
-  const [availabilitySlots, setAvailabilitySlots] = useState([{ id: "initial", days: "mon_sat", start: "", end: "" }]);
+  const [servicesChanged, setServicesChanged] = useState(false);
+  const [offeringState, setOfferingState] = useState<"none" | "conforming" | "legacy_inconsistent">("none");
+  const [availabilitySlots, setAvailabilitySlots] = useState<EditorWindow[]>([{ id: "initial", days: [], start: "", end: "" }]);
+  const [legacySchedule, setLegacySchedule] = useState<{ kind: string; windows: EditorWindow[] } | null>(null);
+  const [scheduleChanged, setScheduleChanged] = useState(false);
+  const [scheduleEmpty, setScheduleEmpty] = useState(true);
+  const [busyPeriods, setBusyPeriods] = useState<BusyEditorPeriod[]>([]);
+  const [busyPeriodsEnabled, setBusyPeriodsEnabled] = useState(false);
+  const [busyPeriodsChanged, setBusyPeriodsChanged] = useState(false);
+  const [addressVerificationRequired, setAddressVerificationRequired] = useState(false);
   const twice = frequency === "Twice daily" && service !== "House cleaning";
   const packageName = useMemo(() => service === "House cleaning" ? "House cleaning" : service === "Utensil cleaning" ? `Utensils · ${frequency.toLowerCase()}` : `House cleaning + utensils · ${frequency.toLowerCase()}`, [service, frequency]);
   const priceFor = (person: MatchPerson) => person.price;
@@ -305,15 +331,13 @@ export default function Home() {
       { label: "3 BHK", price: Number(housePrices.three) },
       { label: "4+ BHK", price: Number(housePrices.fourPlus) },
     ];
-    if (houseCleaningEnabled) {
-      for (const size of sizes) if (size.price > 0) rows.push({ label: `House cleaning · ${size.label}`, price: size.price });
-    }
+    const selected = [houseSizes.oneTwo, houseSizes.three, houseSizes.fourPlus];
+    for (const [index, size] of sizes.entries()) if (selected[index] && size.price > 0) rows.push({ label: `House cleaning · ${size.label}`, price: size.price });
     const oncePrice = Number(utensilsOncePrice);
-    const twicePrice = Number(utensilsTwicePrice);
     if (utensilsOnceEnabled && oncePrice > 0) rows.push({ label: "Utensil cleaning · once daily", price: oncePrice });
-    if (utensilsTwiceEnabled && twicePrice > 0) rows.push({ label: "Utensil cleaning · twice daily", price: twicePrice });
+    if (utensilsOnceEnabled && utensilsTwiceEnabled && oncePrice > 0) rows.push({ label: "Utensil cleaning · twice daily", price: oncePrice * 2 });
     return rows;
-  }, [houseCleaningEnabled, housePrices, utensilsOnceEnabled, utensilsOncePrice, utensilsTwiceEnabled, utensilsTwicePrice]);
+  }, [houseSizes, housePrices, utensilsOnceEnabled, utensilsOncePrice, utensilsTwiceEnabled]);
   const invalidTimes = twice && (!firstTime || !secondTime || secondTime <= firstTime);
 
   function recordClientEvent(eventName: string, properties: Record<string, string> = {}) {
@@ -546,11 +570,13 @@ export default function Home() {
   async function loadHelperRequests(redirect = true) {
     try {
       const response = await fetch("/api/helper/requests", { credentials: "same-origin" });
-      const result = await response.json() as { error?: string; pendingRequest?: StoredRequest | null; activeBooking?: StoredRequest | null; activeBookings?: StoredRequest[]; paymentPending?: TrialPayment | null };
+      const result = await response.json() as { error?: string; pendingRequest?: StoredRequest | null; activeBooking?: StoredRequest | null; activeBookings?: StoredRequest[]; busyPeriods?: BusyEditorPeriod[]; paymentPending?: TrialPayment | null };
       if (!response.ok) throw new Error(result.error || "We could not load your booking requests.");
       const activeBookings = result.activeBookings ?? (result.activeBooking ? [result.activeBooking] : []);
       setHelperRequest(result.pendingRequest ?? null);
       setHelperActiveBookings(activeBookings);
+      setBusyPeriods(result.busyPeriods ?? []);
+      setBusyPeriodsEnabled(Boolean(result.busyPeriods?.length));
       setHelperActiveBooking(current => activeBookings.find(item => item.bookingId === current?.bookingId) ?? activeBookings[0] ?? null);
       setTrialPayment(result.paymentPending ?? null);
       if (result.activeBooking?.bookingStatus === "trial") setBooking("booked");
@@ -781,9 +807,13 @@ export default function Home() {
       .then(async response => {
         const result = await response.json() as {
           error?: string;
-          profile?: { locality?: string; homeAddress?: string; latitude?: number | null; longitude?: number | null; travelDistanceKm?: number | null; yearsExperience?: number; profileStatus?: string } | null;
+          profile?: { locality?: string; homeAddress?: string; addressState?: "none" | "legacy" | "structured"; address?: HelperAddress | null; legacyAddress?: string | null; latitude?: number | null; longitude?: number | null; travelDistanceKm?: number | null; yearsExperience?: number; profileStatus?: string } | null;
           offerings?: Array<{ service_type: string; home_size: string; monthly_price_paise: number; is_active: number }>;
-          availability?: Array<{ id: string; days: string; start: string; end: string }>;
+          offeringState?: "none" | "conforming" | "legacy_inconsistent";
+          services?: { houseCleaning: Array<{ homeSize: string; monthlyPricePaise: number }>; utensils: { frequency: "once" | "twice"; onceDailyMonthlyPricePaise: number } | null } | null;
+          availability?: EditorWindow[];
+          schedule?: { kind: string; requiresConfirmation: boolean; windows: EditorWindow[] };
+          busyPeriods?: BusyEditorPeriod[];
           addressProof?: { filename: string; documentType: string; status: string } | null;
         };
         if (!response.ok) throw new Error(result.error || "We could not load your work profile.");
@@ -793,42 +823,61 @@ export default function Home() {
         if (!hydrateDraft) return;
         helperDraftLoaded.current = true;
         if (result.profile) {
-          setHelperLocality(result.profile.locality || "");
-          if (result.profile.homeAddress && typeof result.profile.latitude === "number" && typeof result.profile.longitude === "number") {
-            setHelperAddress({
-              formattedAddress: result.profile.homeAddress,
-              locality: result.profile.locality || result.profile.homeAddress,
-              latitude: result.profile.latitude,
-              longitude: result.profile.longitude,
-            });
+          if (result.profile.addressState === "structured" && result.profile.address) {
+            setHelperAddressFields(result.profile.address);
+            setPreserveLegacyHelperAddress(false);
+          } else if (result.profile.addressState === "legacy" && result.profile.legacyAddress) {
+            setLegacyHelperAddress(result.profile.legacyAddress);
+            setPreserveLegacyHelperAddress(true);
+          } else {
+            setLegacyHelperAddress("");
+            setPreserveLegacyHelperAddress(false);
+          }
+          if (typeof result.profile.latitude === "number" && typeof result.profile.longitude === "number") {
+            setHelperCoordinates({ latitude: result.profile.latitude, longitude: result.profile.longitude });
           }
           setHelperTravelDistance(result.profile.travelDistanceKm ? String(result.profile.travelDistanceKm) : "");
           setYearsExperience(String(result.profile.yearsExperience ?? 0));
           setProfilePaused(result.profile.profileStatus === "paused");
           setSavedProfileStatus(result.profile.profileStatus || "draft");
         }
-        if (result.offerings?.length) {
-          const activeOfferings = result.offerings.filter(item => Boolean(item.is_active));
-          const price = (serviceType: string, homeSize: string) => {
-            const found = activeOfferings.find(item => item.service_type === serviceType && item.home_size === homeSize);
-            return found ? String(Math.round(found.monthly_price_paise / 100)) : "";
+        setOfferingState(result.offeringState || "none");
+        setServicesChanged(false);
+        if (result.offeringState === "conforming" && result.services) {
+          const price = (homeSize: string) => {
+            const found = result.services?.houseCleaning.find(item => item.homeSize === homeSize);
+            return found ? String(found.monthlyPricePaise / 100) : "";
           };
-          setHouseCleaningEnabled(activeOfferings.some(item => item.service_type === "house_cleaning"));
-          setHousePrices({
-            oneTwo: price("house_cleaning", "one_two_bhk"),
-            three: price("house_cleaning", "three_bhk"),
-            fourPlus: price("house_cleaning", "four_plus_bhk"),
+          setHouseSizes({
+            oneTwo: result.services.houseCleaning.some(item => item.homeSize === "one_two_bhk"),
+            three: result.services.houseCleaning.some(item => item.homeSize === "three_bhk"),
+            fourPlus: result.services.houseCleaning.some(item => item.homeSize === "four_plus_bhk"),
           });
-          setUtensilsOnceEnabled(activeOfferings.some(item => item.service_type === "utensils_once"));
-          setUtensilsOncePrice(price("utensils_once", "not_applicable"));
-          setUtensilsTwiceEnabled(activeOfferings.some(item => item.service_type === "utensils_twice"));
-          setUtensilsTwicePrice(price("utensils_twice", "not_applicable"));
+          setHousePrices({
+            oneTwo: price("one_two_bhk"),
+            three: price("three_bhk"),
+            fourPlus: price("four_plus_bhk"),
+          });
+          setUtensilsOnceEnabled(Boolean(result.services.utensils));
+          setUtensilsOncePrice(result.services.utensils ? String(result.services.utensils.onceDailyMonthlyPricePaise / 100) : "");
+          setUtensilsTwiceEnabled(result.services.utensils?.frequency === "twice");
+        } else if (result.offeringState === "none") {
+          setHouseSizes({ oneTwo: false, three: false, fourPlus: false });
+          setHousePrices({ oneTwo: "", three: "", fourPlus: "" });
+          setUtensilsOnceEnabled(false);
+          setUtensilsOncePrice("");
+          setUtensilsTwiceEnabled(false);
         }
-        if (result.availability?.length) setAvailabilitySlots(result.availability);
+        setScheduleChanged(false);
+        setScheduleEmpty(result.schedule?.kind === "empty");
+        setLegacySchedule(result.schedule?.requiresConfirmation ? result.schedule : null);
+        setAvailabilitySlots(result.availability?.length ? result.availability : [{ id: "initial", days: [], start: "", end: "" }]);
+        setBusyPeriods(result.busyPeriods ?? []);
+        setBusyPeriodsEnabled(Boolean(result.busyPeriods?.length));
+        setBusyPeriodsChanged(false);
         if (result.addressProof) {
           setAddressProofUploaded(["pending", "verified"].includes(result.addressProof.status));
           setAddressProofName(result.addressProof.filename);
-          setAddressProofType(result.addressProof.documentType);
         }
       })
       .catch(error => { if (active) setSetupError(providerMessage(error, "We could not load your work profile.")); })
@@ -1106,7 +1155,7 @@ export default function Home() {
     }
   };
   const uploadAddressProof = async (file?: File) => {
-    if (file) proofRetryRef.current = { file, documentType: addressProofType };
+    if (file) proofRetryRef.current = { file };
     const retry = proofRetryRef.current;
     if (!retry) return;
     setProofRetryAvailable(true);
@@ -1116,7 +1165,6 @@ export default function Home() {
     try {
       const form = new FormData();
       form.append("file", retry.file);
-      form.append("documentType", retry.documentType);
       const response = await fetch("/api/helper/address-proof", { method: "POST", credentials: "same-origin", body: form });
       const result = await response.json() as { error?: string; filename?: string };
       if (!response.ok) throw new Error(result.error || "We could not upload the address proof.");
@@ -1131,46 +1179,88 @@ export default function Home() {
       setProofUploading(false);
     }
   };
+  const editHelperAddress = (field: keyof HelperAddress, value: string) => {
+    setPreserveLegacyHelperAddress(false);
+    setHelperCoordinates(null);
+    setHelperLocationError("");
+    setHelperAddressFields(current => ({ ...current, [field]: value }));
+    setAddressVerificationRequired(true);
+  };
+  const detectHelperCurrentLocation = async () => {
+    setHelperLocationBusy(true);
+    setHelperLocationError("");
+    try {
+      const detected = await detectHelperLocation(navigator.geolocation);
+      setHelperAddressFields(detected.address);
+      setHelperCoordinates({ latitude: detected.latitude, longitude: detected.longitude });
+      setPreserveLegacyHelperAddress(false);
+      setAddressVerificationRequired(true);
+    } catch (error) {
+      setPreserveLegacyHelperAddress(false);
+      setHelperCoordinates(null);
+      setHelperLocationError(providerMessage(error, "We could not detect your location. Enter your address manually."));
+    } finally {
+      setHelperLocationBusy(false);
+    }
+  };
   const saveHelperProfile = async () => {
+    if (setupSavingRef.current) return;
     if (!addressProofUploaded) {
       setSetupError("Upload an address proof before publishing your profile.");
       return;
     }
-    const offerings: Array<{ serviceType: string; homeSize: string; monthlyPriceRupees: number }> = [];
-    if (houseCleaningEnabled) {
-      offerings.push(
-        { serviceType: "house_cleaning", homeSize: "one_two_bhk", monthlyPriceRupees: Number(housePrices.oneTwo) },
-        { serviceType: "house_cleaning", homeSize: "three_bhk", monthlyPriceRupees: Number(housePrices.three) },
-        { serviceType: "house_cleaning", homeSize: "four_plus_bhk", monthlyPriceRupees: Number(housePrices.fourPlus) },
-      );
-    }
-    if (utensilsOnceEnabled) offerings.push({ serviceType: "utensils_once", homeSize: "not_applicable", monthlyPriceRupees: Number(utensilsOncePrice) });
-    if (utensilsTwiceEnabled) offerings.push({ serviceType: "utensils_twice", homeSize: "not_applicable", monthlyPriceRupees: Number(utensilsTwicePrice) });
+    const houseCleaning = [
+      { selected: houseSizes.oneTwo, homeSize: "one_two_bhk", monthlyPricePaise: rupeesToPaise(housePrices.oneTwo) },
+      { selected: houseSizes.three, homeSize: "three_bhk", monthlyPricePaise: rupeesToPaise(housePrices.three) },
+      { selected: houseSizes.fourPlus, homeSize: "four_plus_bhk", monthlyPricePaise: rupeesToPaise(housePrices.fourPlus) },
+    ].filter(item => item.selected).map(({ homeSize, monthlyPricePaise }) => ({ homeSize, monthlyPricePaise }));
+    const services = {
+      houseCleaning,
+      utensils: utensilsOnceEnabled ? {
+        frequency: utensilsTwiceEnabled ? "twice" : "once",
+        onceDailyMonthlyPricePaise: rupeesToPaise(utensilsOncePrice),
+      } : null,
+    };
+    setupSavingRef.current = true;
     setSetupSaving(true);
     setSetupError("");
+    setSetupFields({});
     try {
       const response = await fetch("/api/helper/profile", {
         method: "PUT",
         credentials: "same-origin",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          locality: helperLocality,
-          homeAddress: helperAddress?.formattedAddress,
-          latitude: helperAddress?.latitude,
-          longitude: helperAddress?.longitude,
+          ...(preserveLegacyHelperAddress ? { preserveAddress: true } : {
+            address: helperAddressFields,
+            latitude: helperCoordinates?.latitude ?? null,
+            longitude: helperCoordinates?.longitude ?? null,
+          }),
           travelDistanceKm: Number(helperTravelDistance),
           yearsExperience: Number(yearsExperience),
-          offerings,
-          availability: availabilitySlots,
+          ...(servicesChanged || offeringState === "none" ? { services } : {}),
+          availability: scheduleChanged || scheduleEmpty ? availabilitySlots : undefined,
+          replaceSchedule: scheduleChanged,
+          ...(busyPeriodsChanged || scheduleChanged || scheduleEmpty ? { busyPeriods: busyPeriodsEnabled ? busyPeriods : [] } : {}),
         }),
       });
-      const result = await response.json() as { error?: string };
-      if (!response.ok) throw new Error(result.error || "We could not save your work profile.");
+      const result = await response.json() as { error?: string; fields?: Record<string, string>; verificationStatus?: string };
+      if (!response.ok) {
+        setSetupFields(result.fields ?? {});
+        const first = Object.keys(result.fields ?? {})[0];
+        if (first) setTimeout(() => { const section = document.querySelector<HTMLElement>(`[data-profile-field="${first}"]`); const explicit = first === "address" ? document.querySelector<HTMLElement>(".provider-form [autocomplete='address-line1']") : first === "addressProof" ? proofInputRef.current : first === "travelDistanceKm" ? document.querySelector<HTMLElement>(".provider-form input[step='0.5']") : null; (explicit ?? section)?.scrollIntoView({ behavior: "smooth", block: "center" }); (explicit ?? section?.querySelector<HTMLElement>("input,select,button") ?? document.querySelector<HTMLElement>(".provider-form input:not([type='hidden']),.provider-form select,.provider-form button"))?.focus(); }, 0);
+        throw new Error(result.error || "We could not save your work profile.");
+      }
       setSavedProfileStatus((result as { profileStatus?: string }).profileStatus || "draft");
+      setOfferingState("conforming");
+      setServicesChanged(false);
+      setBusyPeriodsChanged(false);
+      setAddressVerificationRequired(result.verificationStatus === "pending");
       setSetupSubmitted(true);
     } catch (error) {
       setSetupError(providerMessage(error, "We could not save your work profile. Please try again."));
     } finally {
+      setupSavingRef.current = false;
       setSetupSaving(false);
     }
   };
@@ -1253,7 +1343,7 @@ export default function Home() {
   const homeDestination = role === "resident" ? "dashboard" : "providerDashboard";
   const showBack = !["welcome", "requirement", "dashboard", "setup", "providerDashboard"].includes(view);
 
-  const helperSchedule = <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div>{helperActiveBookings.length ? <><div className="job-list">{helperActiveBookings.map(item => <button className={item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><b>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</b><span><strong>{item.residentName}</strong><small>{item.residentAddress} · {item.bookingStatus === "trial" ? "paid trial" : "confirmed booking"}</small></span></button>)}</div>{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</> : <div className="empty-dashboard"><b>No bookings scheduled</b><p>Accepted bookings will appear here.</p></div>}</section>;
+  const helperSchedule = <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div>{busyPeriods.length > 0 && <div className="job-list">{busyPeriods.map(item => <div className="dashboard-info" key={item.id}><b>{item.days.map(day => ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][day]).join(", ")} · {item.start}–{item.end}</b><span><strong>Busy</strong><small>External recurring work</small></span></div>)}</div>}{helperActiveBookings.length ? <><div className="job-list">{helperActiveBookings.map(item => <button className={item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><b>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</b><span><strong>{item.residentName}</strong><small>{item.residentAddress} · {item.bookingStatus === "trial" ? "paid trial" : "confirmed booking"}</small></span></button>)}</div>{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</> : busyPeriods.length === 0 ? <div className="empty-dashboard"><b>No bookings scheduled</b><p>Accepted bookings will appear here.</p></div> : null}</section>;
   const notificationContent = <>
             <div className="notification-panel-head"><div><h2>Notifications</h2><p>Booking updates in one place</p></div>{unreadCount > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div>
             {alertPermission !== "granted" && <div className="browser-alert-card"><span aria-hidden>!</span><div><b>Don’t miss a booking update</b><small>{alertPermission === "denied" ? "Alerts are blocked in your browser settings." : alertPermission === "unsupported" ? "Browser alerts are not supported on this device." : "Allow booking alerts on this device."}</small></div>{alertPermission === "default" && <button onClick={() => void enableBrowserAlerts()}>Turn on</button>}</div>}
@@ -1405,10 +1495,13 @@ export default function Home() {
 
         {view === "setup" && <div className="screen provider-form">{setupSubmitted ? <div className="state-screen"><div className="state-illustration confirmed-art"><span>✓</span></div><Mark>Profile saved</Mark><ScreenTitle title={savedProfileStatus === "active" ? "Residents can now find you" : "Your profile status is unchanged"} text="Your services, prices and available times have been saved. Your address proof is stored privately and marked as provided."/><button className="primary" onClick={() => navTo("providerDashboard")}>Go to your dashboard</button><button className="secondary" onClick={() => setSetupSubmitted(false)}>Edit work profile</button></div> : setupLoading ? <div className="state-screen"><ScreenTitle title="Loading your work profile" text="Your saved services and available times will appear here."/></div> : <>
           <ScreenTitle eyebrow={`Welcome, ${helperName || "home helper"}`} title="Set up your work profile" text="Add your work area, services, prices and free times. You can return and edit them later."/>
-          <section className="form-section"><h2>1. Where you can work</h2><Field label="Where do you usually start work from?" hint="Choose your address from Google suggestions."><GoogleAddressField value={helperAddress?.formattedAddress || ""} onSelect={address => { setHelperAddress(address); setHelperLocality(address.locality); }} onClear={() => { setHelperAddress(null); setHelperLocality(""); }} placeholder="Start typing your home or starting address" /></Field><Field label="Approximately how far are you willing to travel?" hint="Enter a rough estimate. This helps rank suitable work; it is not a strict promise."><div className="distance-input"><input className="text-input" type="number" inputMode="decimal" min="0.1" step="0.5" value={helperTravelDistance} onChange={event => setHelperTravelDistance(event.target.value)} placeholder="For example, 8"/><span>km</span></div></Field><small>Your exact address stays private. Residents will see only an approximate distance when matching.</small></section>
-          <section className="form-section"><div className="inline-heading"><div><h2>2. Address proof</h2><p>Aadhaar, voter ID or another government-issued address proof</p></div></div><Field label="Document type"><select className="text-input" value={addressProofType} disabled={proofUploading} onChange={event => { setAddressProofType(event.target.value); proofRetryRef.current = null; setProofRetryAvailable(false); if (proofInputRef.current) proofInputRef.current.value = ""; }}><option value="aadhaar">Aadhaar</option><option value="voter_id">Voter ID</option><option value="other_address_proof">Other address proof</option></select></Field><input ref={proofInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,application/pdf" onChange={event => void uploadAddressProof(event.target.files?.[0])}/><button className="secondary upload-proof" disabled={proofUploading} onClick={() => proofInputRef.current?.click()}>{proofUploading ? "Uploading securely…" : addressProofUploaded ? "Replace address proof" : "Upload address proof"}</button>{proofRetryAvailable && !proofUploading && <button className="secondary" onClick={() => void uploadAddressProof()}>Retry selected address proof</button>}{addressProofUploaded && <div className="document-status"><Check/><span><b>Address proof provided</b><small>{addressProofName}</small></span></div>}<small>JPG, PNG or PDF · maximum 5 MB. The document is private and is never shown to residents.</small></section>
-          <section className="form-section"><h2>3. Services and monthly prices</h2><Field label="Years of experience"><input className="text-input" type="number" min="0" max="60" value={yearsExperience} onChange={event => setYearsExperience(event.target.value)} placeholder="Enter years"/></Field><div className="service-price-block"><label className="toggle-row"><span><b>House cleaning</b><small>Sweeping, mopping, kitchen and bathroom surfaces; flush cleaning is not included</small></span><input type="checkbox" checked={houseCleaningEnabled} onChange={event => setHouseCleaningEnabled(event.target.checked)}/></label>{houseCleaningEnabled && <div className="price-inputs"><Field label="1–2 BHK"><input className="text-input" inputMode="numeric" value={housePrices.oneTwo} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, oneTwo:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="3 BHK"><input className="text-input" inputMode="numeric" value={housePrices.three} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, three:event.target.value.replace(/\D/g, "")}))}/></Field><Field label="4+ BHK"><input className="text-input" inputMode="numeric" value={housePrices.fourPlus} placeholder="₹ monthly" onChange={event => setHousePrices(current => ({...current, fourPlus:event.target.value.replace(/\D/g, "")}))}/></Field></div>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · once daily</b></span><input type="checkbox" checked={utensilsOnceEnabled} onChange={event => setUtensilsOnceEnabled(event.target.checked)}/></label>{utensilsOnceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsOncePrice} placeholder="₹ monthly" onChange={event => setUtensilsOncePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div><div className="service-price-block"><label className="toggle-row"><span><b>Utensil cleaning · twice daily</b></span><input type="checkbox" checked={utensilsTwiceEnabled} onChange={event => setUtensilsTwiceEnabled(event.target.checked)}/></label>{utensilsTwiceEnabled && <Field label="Monthly price"><input className="text-input" inputMode="numeric" value={utensilsTwicePrice} placeholder="₹ monthly" onChange={event => setUtensilsTwicePrice(event.target.value.replace(/\D/g, ""))}/></Field>}</div></section>
-          <section className="form-section"><h2>4. Available recurring times</h2><p className="section-copy">Add every regular time during which residents may book you.</p><div className="availability-slots">{availabilitySlots.map((slot, index) => <div className="availability-slot" key={slot.id}><Field label="Days"><select className="text-input" value={slot.days} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, days:event.target.value} : item))}><option value="mon_sat">Monday–Saturday</option><option value="mon_fri">Monday–Friday</option><option value="every_day">Every day</option></select></Field><div className="time-grid"><Field label="From"><input className="time-input" type="time" value={slot.start} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, start:event.target.value} : item))}/></Field><Field label="Until"><input className="time-input" type="time" value={slot.end} onChange={event => setAvailabilitySlots(current => current.map(item => item.id === slot.id ? {...item, end:event.target.value} : item))}/></Field></div>{availabilitySlots.length > 1 && <button className="text-button danger" onClick={() => setAvailabilitySlots(current => current.filter(item => item.id !== slot.id))}>Remove this time</button>}</div>)}</div><button className="secondary add-slot" onClick={() => setAvailabilitySlots(current => [...current, {id:crypto.randomUUID(), days:"mon_sat", start:"18:00", end:"20:00"}])}>+ Add another available time</button><small>A 15-minute travel buffer is enforced automatically between bookings.</small></section>
+          <section className="form-section"><h2>1. Where you can work</h2><p>Detect your location to fill what we can, then check the address before saving. You can always enter or correct it manually.</p><button type="button" className="secondary" disabled={helperLocationBusy} onClick={() => void detectHelperCurrentLocation()}>{helperLocationBusy ? "Detecting location…" : "Use my current location"}</button>{helperLocationError && <p className="field-error" role="alert">{helperLocationError}</p>}{preserveLegacyHelperAddress && <div className="info-banner"><span>i</span><p>Your existing address is preserved: {legacyHelperAddress || "saved legacy address"}. Enter a corrected address below only if you want to replace it.</p><button type="button" className="secondary" onClick={() => setPreserveLegacyHelperAddress(false)}>Enter a corrected address</button></div>}{!preserveLegacyHelperAddress && <><Field label="House or flat number"><input className="text-input" autoComplete="address-line1" value={helperAddressFields.houseOrFlat} onChange={event => editHelperAddress("houseOrFlat", event.target.value)} /></Field><Field label="Floor (optional)"><input className="text-input" value={helperAddressFields.floor} onChange={event => editHelperAddress("floor", event.target.value)} /></Field><Field label="Building, complex or society (optional)"><input className="text-input" autoComplete="address-line2" value={helperAddressFields.buildingOrSociety} onChange={event => editHelperAddress("buildingOrSociety", event.target.value)} /></Field><Field label="City"><input className="text-input" autoComplete="address-level2" value={helperAddressFields.city} onChange={event => editHelperAddress("city", event.target.value)} /></Field><Field label="State"><input className="text-input" autoComplete="address-level1" value={helperAddressFields.state} onChange={event => editHelperAddress("state", event.target.value)} /></Field><Field label="PIN code"><input className="text-input" autoComplete="postal-code" inputMode="numeric" maxLength={6} value={helperAddressFields.pinCode} onChange={event => editHelperAddress("pinCode", event.target.value.replace(/\D/g, ""))} /></Field>{helperCoordinates && <div className="address-confirmed"><span>✓</span><span><b>Location detected</b><small>Coordinates will be used only for distance and matching.</small></span></div>}</>}<Field label="Approximately how far are you willing to travel?" hint="Enter a rough estimate. This helps rank suitable work; it is not a strict promise."><div className="distance-input"><input className="text-input" type="number" inputMode="decimal" min="0.1" step="0.5" value={helperTravelDistance} onChange={event => setHelperTravelDistance(event.target.value)} placeholder="For example, 8"/><span>km</span></div></Field><small>Your exact address stays private. Residents will see only an approximate distance when matching.</small></section>
+          <section className="form-section"><div className="inline-heading"><div><h2>2. Address proof</h2><p>Upload a photograph or image scan of your address proof</p></div></div><input ref={proofInputRef} className="visually-hidden" type="file" accept=".jpg,.jpeg,.png,image/jpeg,image/png" onChange={event => void uploadAddressProof(event.target.files?.[0])}/><button className="secondary upload-proof" disabled={proofUploading} onClick={() => proofInputRef.current?.click()}>{proofUploading ? "Uploading securely…" : addressProofUploaded ? "Replace address proof" : "Upload address proof"}</button>{proofRetryAvailable && !proofUploading && <button className="secondary" onClick={() => void uploadAddressProof()}>Retry selected address proof</button>}{addressProofUploaded && <div className="document-status"><Check/><span><b>Address proof provided</b><small>{addressProofName}</small></span></div>}<small>JPEG or PNG · maximum 5 MB. The document is private and is never shown to residents.</small></section>
+          <section className="form-section"><h2>3. Services and monthly prices</h2><div data-profile-field="yearsExperience"><Field label="Years of experience"><input className="text-input" aria-invalid={Boolean(setupFields.yearsExperience)} type="number" min="0" max="60" value={yearsExperience} onChange={event => setYearsExperience(event.target.value)} placeholder="Enter years"/></Field>{setupFields.yearsExperience && <p className="field-error" role="alert">{setupFields.yearsExperience}</p>}</div><HelperServicePricing offeringState={offeringState} servicesChanged={servicesChanged} houseSizes={houseSizes} setHouseSizes={setHouseSizes} housePrices={housePrices} setHousePrices={setHousePrices} utensilsEnabled={utensilsOnceEnabled} setUtensilsEnabled={setUtensilsOnceEnabled} utensilsTwice={utensilsTwiceEnabled} setUtensilsTwice={setUtensilsTwiceEnabled} utensilsOncePrice={utensilsOncePrice} setUtensilsOncePrice={setUtensilsOncePrice} markChanged={() => setServicesChanged(true)} error={setupFields.offerings}/></section>
+          <HelperWorkingHours value={availabilitySlots[0]} legacy={legacySchedule} error={setupFields.availability} onReplace={() => { setLegacySchedule(null); setScheduleChanged(true); setAvailabilitySlots([{ id: "replacement", days: [], start: "", end: "" }]); }} onChange={value => { setScheduleChanged(true); setAvailabilitySlots([value]); }}/>
+          {!legacySchedule && <div><HelperBusyPeriods working={availabilitySlots[0]} value={busyPeriods} enabled={busyPeriodsEnabled} error={setupFields.busyPeriods} onEnabled={enabled => { setBusyPeriodsEnabled(enabled); setBusyPeriodsChanged(true); }} onChange={value => { setBusyPeriods(value); setBusyPeriodsChanged(true); }}/></div>}
+          {addressVerificationRequired && <p className="info-banner" role="status">Address verification required</p>}
+          {Object.entries(setupFields).filter(([field]) => !["availability", "busyPeriods"].includes(field)).map(([field, message]) => <p className="field-error" role="alert" data-profile-field={field} key={field}>{message}</p>)}
           <section className="privacy-note"><b>Your privacy matters</b><p>Residents never see your proof document, exact home address or phone number before an accepted booking.</p></section>{setupError && <p className="auth-error" role="alert">{setupError}</p>}<button className="primary" disabled={setupSaving || proofUploading} onClick={() => void saveHelperProfile()}>{setupSaving ? "Saving profile…" : "Save and publish profile"}</button>
         </>}</div>}
 

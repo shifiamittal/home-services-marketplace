@@ -23,7 +23,7 @@ export function fixture({ clock } = {}) {
   }
   sql.exec("PRAGMA foreign_keys=ON");
   const migrations = readdirSync("drizzle").filter(name => /^\d{4}.*\.sql$/.test(name)).sort();
-  if (migrations.length !== 11) throw new Error("Review migration fixture count");
+  if (migrations.length !== 13) throw new Error("Review migration fixture count");
   for (const file of migrations) sql.exec(readFileSync(path.join("drizzle", file), "utf8"));
   // D1 returns JSON numbers. Read SQLite int64 values without node:sqlite's
   // safe-integer exception, then model that number conversion at the adapter boundary.
@@ -105,6 +105,7 @@ export function fixture({ clock } = {}) {
     return loadedModule.exports;
   }
   sql.exec(`INSERT INTO users(id,name,mobile_e164) VALUES ('helper','Synthetic helper','+10000000000'),('resident','Synthetic resident','+10000000001');
+    INSERT INTO user_roles(user_id,role) VALUES ('helper','helper'),('resident','resident');
     INSERT INTO resident_profiles(user_id) VALUES ('resident');
     INSERT INTO resident_addresses(id,resident_user_id,house_or_flat,locality,latitude_e6,longitude_e6,is_primary)
       VALUES ('address','resident','Fixture','Fixture',10000000,20000000,1);
