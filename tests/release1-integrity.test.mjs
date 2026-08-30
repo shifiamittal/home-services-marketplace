@@ -156,7 +156,7 @@ test("late booking loads retain authorized state, and proof retry retains only a
   assert.match(source, /form.append\("file", retry.file\)/);
   assert.match(source, /Retry selected address proof/);
   assert.doesNotMatch(source, /view === "membership"|setPaymentOpen/);
-  assert.match(source, /No bookings scheduled/);
+  assert.match(source, /No schedule yet/);
   assert.match(source, /Helper dashboard/);
 });
 
