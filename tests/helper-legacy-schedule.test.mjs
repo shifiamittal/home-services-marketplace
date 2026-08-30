@@ -3,7 +3,7 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { fixture, jsonRequest, profilePayload, referenceSlot } from "./helpers/local-routes.mjs";
-import { exactDays, loadSchedule, weekdayOrder } from "../app/lib/helper-schedule.ts";
+import { betaTimeOptions, daySummary, exactDays, formatDisplayTime, loadSchedule, weekdayOrder } from "../app/lib/helper-schedule.ts";
 
 const route = "app/api/helper/profile/route.ts";
 function setup(t) {
@@ -39,6 +39,18 @@ test("all 127 nonempty subsets retain actual weekdays in Monday–Sunday output 
     assert.equal(schedule.windows[0].start, "00:15");
     assert.equal(schedule.windows[0].end, "24:00");
   }
+});
+
+test("mobile summaries and AM/PM labels retain canonical schedule meaning", () => {
+  assert.equal(daySummary([1,2,3,4,5,6,0]), "Every day");
+  assert.equal(daySummary([1,2,3,4,5]), "Weekdays");
+  assert.equal(daySummary([1,3,0]), "Mon, Wed, Sun");
+  assert.equal(formatDisplayTime("17:00"), "5:00 PM");
+  assert.equal(formatDisplayTime("13:00"), "1:00 PM");
+  assert.equal(formatDisplayTime("02:00"), "2:00 AM");
+  assert.ok(betaTimeOptions("09:15").includes("09:15"));
+  assert.ok(betaTimeOptions("17:00").includes("17:00"));
+  assert.ok(betaTimeOptions("", true).includes("24:00"));
 });
 
 test("null, empty, malformed and contradictory metadata never override stored weekdays", async t => {
@@ -135,8 +147,11 @@ test("rendered common editor has seven days; heterogeneous schedule requires con
   const editor = renderToStaticMarkup(createElement(HelperWorkingHours, { ...props, legacy: null }));
   assert.equal((editor.match(/type="checkbox"/g) ?? []).length, 7);
   assert.equal((editor.match(/checked=""/g) ?? []).length, 1);
+  assert.match(editor, /day-button-grid/);
+  assert.match(editor, /value="08:00"[^>]*>8:00 AM/);
+  assert.doesNotMatch(editor, />08:00</);
   const legacy = renderToStaticMarkup(createElement(HelperWorkingHours, { ...props, legacy: { kind: "heterogeneous", windows: [value] } }));
   assert.match(legacy, /Replace my legacy schedule/);
-  assert.match(legacy, /Wednesday/);
+  assert.match(legacy, /Wed: 8:00 AM–2:00 PM/);
   assert.doesNotMatch(legacy, /type="checkbox"/);
 });

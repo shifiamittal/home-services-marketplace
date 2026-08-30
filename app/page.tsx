@@ -1,7 +1,7 @@
 "use client";
 
 import { HelperWorkingHours } from "./components/helper-working-hours";
-import type { EditorWindow } from "./lib/helper-schedule";
+import { daySummary, formatDisplayTime, type EditorWindow } from "./lib/helper-schedule";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { detectHelperLocation, GoogleAddressField, SelectedAddress } from "./components/google-address-field";
 import type { HelperAddress } from "./lib/helper-address";
@@ -1343,7 +1343,11 @@ export default function Home() {
   const homeDestination = role === "resident" ? "dashboard" : "providerDashboard";
   const showBack = !["welcome", "requirement", "dashboard", "setup", "providerDashboard"].includes(view);
 
-  const helperSchedule = <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div>{busyPeriods.length > 0 && <div className="job-list">{busyPeriods.map(item => <div className="dashboard-info" key={item.id}><b>{item.days.map(day => ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][day]).join(", ")} · {item.start}–{item.end}</b><span><strong>Busy</strong><small>External recurring work</small></span></div>)}</div>}{helperActiveBookings.length ? <><div className="job-list">{helperActiveBookings.map(item => <button className={item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><b>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</b><span><strong>{item.residentName}</strong><small>{item.residentAddress} · {item.bookingStatus === "trial" ? "paid trial" : "confirmed booking"}</small></span></button>)}</div>{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</> : busyPeriods.length === 0 ? <div className="empty-dashboard"><b>No bookings scheduled</b><p>Accepted bookings will appear here.</p></div> : null}</section>;
+  const helperSchedule = <section className="dashboard-block"><div className="section-head"><h2>Schedule</h2></div><div className="schedule-card-list">
+    {availabilitySlots.filter(item => item.days.length && item.start && item.end).map(item => <div className="schedule-card" key={`available-${item.id}`}><strong>Available</strong><span>{daySummary(item.days)}</span><small>{formatDisplayTime(item.start)}–{formatDisplayTime(item.end)}</small></div>)}
+    {busyPeriods.map(item => <div className="schedule-card" key={`busy-${item.id}`}><strong>Busy</strong><span>{daySummary(item.days)}</span><small>{formatDisplayTime(item.start)}–{formatDisplayTime(item.end)}</small></div>)}
+    {helperActiveBookings.map(item => <button className={`schedule-card ${item.bookingId === helperActiveBooking?.bookingId ? "selected" : ""}`} key={item.bookingId || item.id} onClick={() => setHelperActiveBooking(item)}><strong>{item.bookingStatus === "trial" ? "Paid trial" : "Booked"}</strong><span>{item.slots.map(slot => formatTime(slot.startTime)).join(" & ")}</span></button>)}
+  </div>{!availabilitySlots.some(item => item.days.length && item.start && item.end) && busyPeriods.length === 0 && helperActiveBookings.length === 0 ? <div className="empty-dashboard"><b>No schedule yet</b><p>Add your working days and hours to get started.</p></div> : null}{canCancelBooking && <button className="secondary danger-outline" onClick={() => { setCancelReason(""); setCancelError(""); setCancelOpen(true); }}>Cancel selected booking</button>}</section>;
   const notificationContent = <>
             <div className="notification-panel-head"><div><h2>Notifications</h2><p>Booking updates in one place</p></div>{unreadCount > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div>
             {alertPermission !== "granted" && <div className="browser-alert-card"><span aria-hidden>!</span><div><b>Don’t miss a booking update</b><small>{alertPermission === "denied" ? "Alerts are blocked in your browser settings." : alertPermission === "unsupported" ? "Browser alerts are not supported on this device." : "Allow booking alerts on this device."}</small></div>{alertPermission === "default" && <button onClick={() => void enableBrowserAlerts()}>Turn on</button>}</div>}

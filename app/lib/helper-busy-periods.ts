@@ -13,7 +13,7 @@ export function parseBusyPeriods(value: unknown): BusyPeriod[] {
     let days: number[];
     try { days = exactDays(row.days); } catch { throw new Error("Choose working days for every busy period."); }
     const start = minuteOfDay(row.start), end = minuteOfDay(row.end);
-    if (!validWindow({ day_of_week: days[0], start_minute: start, end_minute: end })) throw new Error("Use 15-minute busy periods with an end time after the start.");
+    if (!validWindow({ day_of_week: days[0], start_minute: start, end_minute: end })) throw new Error("Choose an end time after the start time.");
     periods.push({ days, start, end });
   }
   const expanded = periods.flatMap(period => period.days.map(day => ({ day, start: period.start, end: period.end })));

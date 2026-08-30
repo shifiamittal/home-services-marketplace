@@ -57,10 +57,19 @@ test("matching and request admission exclude active external busy periods", asyn
   const request=await f.load("app/api/resident/requests/route.ts").POST(jsonRequest(body,"POST")); assert.equal(request.status,409); assert.equal(f.sql.prepare("SELECT count(*) n FROM booking_requests").get().n,0);
 });
 
-test("busy UI is mobile-safe, private and has add/edit/remove controls without slot counts", t => {
+test("other-work UI uses plain language, canonical values and private mobile controls", t => {
   const f=setup(t); const {HelperBusyPeriods}=f.load("app/components/helper-busy-periods.tsx"); const noop=()=>{};
   const html=renderToStaticMarkup(createElement(HelperBusyPeriods,{working:{id:"w",days:[1,2],start:"08:00",end:"12:00"},value:[{id:"b",days:[1],start:"09:00",end:"10:00"}],enabled:true,onEnabled:noop,onChange:noop,error:"Fix busy time"}));
-  assert.match(html,/Do you already have work during these hours/); assert.match(html,/Add busy period/); assert.match(html,/Remove busy period/); assert.match(html,/Fix busy time/); assert.doesNotMatch(html,/employer|available slots|slot count/i);
+  assert.match(html,/Do you work at another home during these hours/); assert.match(html,/Add another work time/); assert.match(html,/Remove work time/); assert.match(html,/Which days\?/); assert.match(html,/value="09:00"[^>]*>9:00 AM/); assert.match(html,/Fix busy time/); assert.doesNotMatch(html,/employer|available slots|slot count|15-minute/i);
+});
+
+test("other-work add action follows first-then-another hierarchy", t => {
+  const f=setup(t); const {HelperBusyPeriods}=f.load("app/components/helper-busy-periods.tsx"); const noop=()=>{};
+  const props={working:{id:"w",days:[1],start:"08:00",end:"12:00"},enabled:true,onEnabled:noop,onChange:noop};
+  const empty=renderToStaticMarkup(createElement(HelperBusyPeriods,{...props,value:[]}));
+  assert.match(empty,/Add first work time/); assert.doesNotMatch(empty,/Add another work time|Work time 1/);
+  const one=renderToStaticMarkup(createElement(HelperBusyPeriods,{...props,value:[{id:"one",days:[1],start:"09:00",end:"10:00"}]}));
+  assert.match(one,/Work time 1[\s\S]*Add another work time/); assert.doesNotMatch(one,/Add first work time/);
 });
 
 test("profile save source retains drafts, binds fields, focuses errors, blocks duplicates and preserves proof retry",()=>{
