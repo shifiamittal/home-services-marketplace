@@ -97,7 +97,7 @@ export function fixture({ clock } = {}) {
       };
       if (resolved.endsWith(path.join("lib", "push"))) return { sendPushToUser: async () => undefined };
       if (!id.startsWith(".")) throw new Error("Unexpected test dependency: " + id);
-      return load(existsSync(resolved) ? resolved : resolved + ".ts");
+      return load(existsSync(resolved) ? resolved : existsSync(resolved + ".ts") ? resolved + ".ts" : resolved + ".tsx");
     };
     vm.runInNewContext(compiled, { module: loadedModule, exports: loadedModule.exports, require, Response, Request, File, FormData,
       URL, crypto, Uint8Array, TextEncoder, TextDecoder, Buffer, Error, Date: ClockDate,

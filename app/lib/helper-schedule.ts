@@ -6,6 +6,27 @@ export function formatMinute(value: number) {
   return `${String(Math.floor(value / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}`;
 }
 
+export function formatDisplayTime(value: string) {
+  const minute = minuteOfDay(value);
+  if (minute < 0) return value;
+  const hour = Math.floor(minute / 60) % 24;
+  return `${hour % 12 || 12}:${String(minute % 60).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
+}
+
+export function daySummary(days: readonly number[]) {
+  const selected = weekdayOrder.filter(day => days.includes(day));
+  if (selected.length === 7) return "Every day";
+  if (selected.length === 5 && selected.every((day, index) => day === weekdayOrder[index])) return "Weekdays";
+  const shortNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  return selected.map(day => shortNames[day]).join(", ");
+}
+
+export function betaTimeOptions(current: string, includeEnd = false) {
+  const options = Array.from({ length: includeEnd ? 49 : 48 }, (_, index) => formatMinute(index * 30));
+  if (minuteOfDay(current) >= 0 && !options.includes(current)) options.push(current);
+  return options.sort((a, b) => minuteOfDay(a) - minuteOfDay(b));
+}
+
 export function minuteOfDay(value: unknown) {
   if (value === "24:00") return 1440;
   if (typeof value !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) return -1;
